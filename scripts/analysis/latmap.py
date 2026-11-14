@@ -22,9 +22,11 @@ CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]|\x1b\[[0-9;]*[a-
 
 
 def sanitize_text(value: Any) -> str:
-    """Strip ANSI escape sequences and control characters from untrusted input."""
-    text = str(value or "").strip()
-    return CONTROL_CHAR_RE.sub("", text)
+    if value is None:
+        return ""
+    cleaned = _ANSI_RE.sub("", str(value))
+    cleaned = _CONTROL_RE.sub("", cleaned)
+    return " ".join(cleaned.split()).strip()
 
 
 def slugify(value: str) -> str:
