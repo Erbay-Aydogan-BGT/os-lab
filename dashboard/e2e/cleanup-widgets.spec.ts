@@ -33,7 +33,7 @@ async function mockConsole(page: import("@playwright/test").Page, widget: object
     else if (path === "/api/cleanup/permissions") data = { platform: "macos", permissions: [] };
     else if (path === "/api/cleanup/monitor") data = { enabled: true, running: true, intervalSeconds: 300, cooldownSeconds: 3600, volumes: [], state: { volumes: {}, events: [], lastEvaluationAt: null, lastError: null }, activeWarnings: [], configError: null, checkedAt: 1 };
     else if (path === "/api/cleanup/volumes") data = { platform: "macos", threshold: 0.9, volumes: [], homeVolume: null, warnings: [], error: null };
-    else if (path === "/api/cleanup/bookmarks") data = { bookmarks: [], error: null };
+    else if (path === "/api/cleanup/bookmarks") data = { bookmarks: [{ entryId: "system.caches", createdAt: 1000, priority: 1, quickClean: true, autoCleanHook: { enabled: false, lastRunAt: null }, sizeAlert: { enabled: false, thresholdBytes: 0, armed: false, lastAlertAt: null }, entry: { name: "Caches", risk: "low", category: "system", needsPrivilege: false, paths: [{ template: "~/Caches", path: "/tmp/caches", reason: "" }] } }], error: null }; // one quick-clean bookmark: these tests cover the bookmark path (CUX-02 covers the fallback)
     else if (path === "/api/cleanup/bookmarks/quick-clean") data = { job: { id: "plan-widget", kind: "plan", state: "running", request: { entryIds: ["a"] }, progress: null, result: null, error: null, startedAt: 1, finishedAt: null }, refusals: [] };
     else if (path === "/api/cleanup/jobs/plan-widget") data = { id: "plan-widget", kind: "plan", state: "done", request: { entryIds: ["a"] }, progress: null, result: { planId: "p1", mode: "trash", totals: { ready: 1, bytes: 1024, skipped: 0 }, items: [], expiresAt: 9_000_000_000 }, error: null, startedAt: 1, finishedAt: 2 };
     else if (path === "/api/cleanup/history") data = { entries: [], total: 0, verified: true };
@@ -58,8 +58,7 @@ test("the widgets card renders the snapshot preview and republishes", async ({ p
   await expect(page.getByText("Kept up to date automatically.")).toBeVisible();
   expect(publishes.length).toBeGreaterThan(0);
   await expect(page.getByRole("button", { name: "Publish now" })).toHaveCount(0);
-  // The preview mirrors the widget's content, collapsed until asked for.
-  await page.getByText("What the widget shows", { exact: true }).click();
+  // CUX-05: the preview mirrors the widget's content and is open by default when the widget can be published.
   await expect(page.getByText("Ready to clean")).toBeVisible();
   await expect(page.getByText("18 items")).toBeVisible();
   await expect(page.getByText("3.9 GB")).toBeVisible();
