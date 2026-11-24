@@ -72,3 +72,12 @@ do not distribute OS media; users are responsible for valid licences.
 [[dashboard/scripts/source-brain-model.test.mjs]] validates provider paths, graph
 limits/windows and bounded revision diff without a browser.
 [[source-lab/RUNBOOK.md]] records the portable release/rollback workflow.
+
+## Analysis Session Brain-Map (`scripts/analysis/latmap.py`)
+
+`scripts/analysis/latmap.py` converts structured analysis session JSON files into `lat.md`-compatible Markdown brain-maps (`[[doc_path#node-id|label]]`) and validates graph integrity across targets, scripts, and findings.
+
+- Defaults missing target authorization fields (`scope`, `notes`) to `unverified` instead of assuming authorization.
+- Fails loudly on missing or colliding node IDs and non-list fields (`targets`, `tags`) rather than silently dropping records.
+- Strips all ANSI/VT escape sequences and control characters, escapes raw HTML in Markdown output, and writes files atomically with `fcntl.flock` locking and revision monotonicity checks.
+- Verification: `PYTHONPATH=. python3 -m pytest tests/test_latmap.py -v`
