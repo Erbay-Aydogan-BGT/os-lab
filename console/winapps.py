@@ -18,6 +18,7 @@ import threading
 import time
 import unicodedata
 import zlib
+from contextlib import contextmanager
 from ctypes import wintypes
 from pathlib import Path
 from typing import Any, Iterator
@@ -57,7 +58,9 @@ MAX_UIA_WORKERS = 2
 UIA_READ_TIMEOUT_SECONDS = 3.0
 CONTROL_TIMEOUT_SECONDS = 600
 CONTROL_AUDIT_MAX = 200
+CONTROL_AUDIT_DISPLAY_MAX = 12
 MAX_INPUT_TEXT_CHARS = 200
+MAX_SCROLL_DELTA = 1200
 MAX_ACTION_CACHE = CONTROL_AUDIT_MAX
 INPUT_KEYS = {
     "tab": 0x09,
@@ -70,6 +73,16 @@ INPUT_KEYS = {
     "right": 0x27,
     "enter": 0x0D,
 }
+INPUT_MOUSE_KINDS = {"double_click", "right_click", "scroll"}
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
+MOUSEEVENTF_WHEEL = 0x0800
+MOUSEEVENTF_HWHEEL = 0x1000
+MOUSEEVENTF_ABSOLUTE = 0x8000
+MOUSEEVENTF_VIRTUALDESK = 0x4000
 TOOL_CLASSES = {
     "Shell_TrayWnd",
     "Shell_SecondaryTrayWnd",
@@ -221,6 +234,12 @@ if sys.platform == "win32":
     if hasattr(_user32, "SetProcessDpiAwarenessContext"):  # Windows 10 1703+; older hosts use Shcore
         _user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
         _user32.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
+        if hasattr(_user32, "SetThreadDpiAwarenessContext"):
+            _user32.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+            _user32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+        if hasattr(_user32, "GetDpiForWindow"):
+            _user32.GetDpiForWindow.argtypes = [wintypes.HWND]
+            _user32.GetDpiForWindow.restype = wintypes.UINT
 
     _gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
     _gdi32.CreateCompatibleDC.restype = wintypes.HDC
@@ -232,18 +251,18 @@ if sys.platform == "win32":
     _gdi32.DeleteObject.restype = wintypes.BOOL
     _gdi32.DeleteDC.argtypes = [wintypes.HDC]
     _gdi32.DeleteDC.restype = wintypes.BOOL
-    _gdi32.GetDIBits.argtypes = [
-        wintypes.HDC, wintypes.HBITMAP, ctypes.c_uint, ctypes.c_uint,
-        ctypes.c_void_p, ctypes.POINTER(_BITMAPINFO), ctypes.c_uint,
-    ]
-    _gdi32.GetDIBits.restype = ctypes.c_int
+    _gdi32.PatBlt.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.DWORD]
+    _gdi32.PatBlt.restype = wintypes.BOOL
     _gdi32.BitBlt.argtypes = [
         wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
         wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.DWORD,
     ]
     _gdi32.BitBlt.restype = wintypes.BOOL
-    _gdi32.PatBlt.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.DWORD]
-    _gdi32.PatBlt.restype = wintypes.BOOL
+    _gdi32.GetDIBits.argtypes = [
+        wintypes.HDC, wintypes.HBITMAP, ctypes.c_uint, ctypes.c_uint,
+        ctypes.c_void_p, ctypes.POINTER(_BITMAPINFO), ctypes.c_uint,
+    ]
+    _gdi32.GetDIBits.restype = ctypes.c_int
 
     _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     _kernel32.OpenProcess.restype = wintypes.HANDLE
@@ -311,8 +330,6 @@ else:
 
 _STREAM_SLOTS = threading.BoundedSemaphore(MAX_ACTIVE_STREAMS)
 
-_STREAM_SLOTS = threading.BoundedSemaphore(MAX_ACTIVE_STREAMS)
-
 
 def _set_dpi_awareness() -> None:
     """Set per-monitor DPI awareness once, so coordinates stay physical pixels."""
@@ -331,6 +348,31 @@ def _set_dpi_awareness() -> None:
 
 
 _set_dpi_awareness()
+
+
+@contextmanager
+def _physical_dpi_context():
+    """Use physical screen pixels for Win32 bounds and input, even with a host manifest."""
+    set_context = getattr(_user32, "SetThreadDpiAwarenessContext", None)
+    if not callable(set_context):
+        yield
+        return
+    previous = set_context(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+    if not previous:
+        yield
+        return
+    try:
+        yield
+    finally:
+        set_context(previous)
+
+
+def _window_dpi(hwnd: int) -> int | None:
+    get_dpi = getattr(_user32, "GetDpiForWindow", None)
+    if not callable(get_dpi):
+        return None
+    dpi = int(get_dpi(hwnd))
+    return dpi if 48 <= dpi <= 768 else None
 
 
 def unavailable(reason: str) -> dict[str, Any]:
@@ -412,9 +454,11 @@ def _window(hwnd: int) -> dict[str, Any] | None:
     _user32.GetClassNameW(hwnd, class_name, 256)
     if not class_name.value or class_name.value in TOOL_CLASSES:
         return None
-    rect = _RECT()
-    if not _user32.GetWindowRect(hwnd, rect):
-        return None
+    with _physical_dpi_context():
+        rect = _RECT()
+        if not _user32.GetWindowRect(hwnd, rect):
+            return None
+        dpi = _window_dpi(hwnd)
     width, height = rect.right - rect.left, rect.bottom - rect.top
     if width <= 0 or height <= 0:
         return None
@@ -432,6 +476,7 @@ def _window(hwnd: int) -> dict[str, Any] | None:
         "y": int(rect.top),
         "width": int(width),
         "height": int(height),
+        "dpi": dpi,
     }
 
 
@@ -537,21 +582,46 @@ def validate_png_frame(frame: bytes) -> None:
 
 def _window_unoccluded(hwnd: int, window: dict[str, Any]) -> bool:
     """Only allow desktop-pixel fallback when no higher window overlaps the target."""
-    if _user32 is None or not hasattr(_user32, "GetWindow"):
+    if _user32 is None:
         return False
     left, top = window["x"], window["y"]
     right, bottom = left + window["width"], top + window["height"]
-    above = _user32.GetWindow(hwnd, GW_HWNDPREV)
-    for _ in range(512):
-        if not above:
-            return True
-        if _user32.IsWindowVisible(above) and not _user32.IsIconic(above):
-            rect = _RECT()
-            if _user32.GetWindowRect(above, rect):
-                if max(left, rect.left) < min(right, rect.right) and max(top, rect.top) < min(bottom, rect.bottom):
+    if hasattr(_user32, "GetWindow"):
+        above = _user32.GetWindow(hwnd, GW_HWNDPREV)
+        for _ in range(512):
+            if not above:
+                break
+            if _user32.IsWindowVisible(above) and not _user32.IsIconic(above) and not _cloaked(above):
+                rect = _RECT()
+                if _user32.GetWindowRect(above, rect):
+                    if max(left, rect.left) < min(right, rect.right) and max(top, rect.top) < min(bottom, rect.bottom):
+                        return False
+            above = _user32.GetWindow(above, GW_HWNDPREV)
+        else:
+            return False
+    if hasattr(_user32, "EnumWindows"):
+        found = False
+        occluded = False
+
+        def callback(candidate: int, _lparam: int) -> bool:
+            nonlocal found, occluded
+            if candidate == hwnd:
+                found = True
+                return False
+            if not found and _user32.IsWindowVisible(candidate) and not _user32.IsIconic(candidate) \
+                    and not _cloaked(candidate):
+                rect = _RECT()
+                if _user32.GetWindowRect(candidate, rect) and (
+                    max(left, rect.left) < min(right, rect.right)
+                    and max(top, rect.top) < min(bottom, rect.bottom)
+                ):
+                    occluded = True
                     return False
-        above = _user32.GetWindow(above, GW_HWNDPREV)
-    return not above
+            return True
+
+        _user32.EnumWindows(_ENUM_WINDOWS_PROC(callback), 0)
+        return found and not occluded
+    return hasattr(_user32, "GetWindow")
 
 
 def _send_bounded_window_print(hwnd: int, memory_dc: Any) -> bool:
@@ -565,7 +635,7 @@ def _send_bounded_window_print(hwnd: int, memory_dc: Any) -> bool:
 
 
 def _capture_desktop_fallback(memory_dc: Any, window: dict[str, Any]) -> bool:
-    """Copy visible desktop pixels only when the target's full bounds are unobscured."""
+    """Copy visible desktop pixels only when the target bounds are unobscured."""
     screen_dc = _user32.GetDC(0)
     if not screen_dc:
         return False
@@ -590,9 +660,15 @@ def _bitmap_pixels(memory_dc: Any, bitmap: Any, old_bitmap: Any, width: int, hei
     bitmap_info.bmiHeader.biSizeImage = width * height * 4
     pixels = (ctypes.c_ubyte * (width * height * 4))()
     rows = _gdi32.GetDIBits(memory_dc, bitmap, 0, height, pixels, ctypes.byref(bitmap_info), 0)
+    _gdi32.SelectObject(memory_dc, bitmap)
     if rows != height:
         raise WinAppError("Could not read the captured window pixels")
     return bytes(pixels)
+
+
+def _black_frame(bgra: bytes) -> bool:
+    """Sample every fourth pixel; a blank PrintWindow result is retried, not shown as a frame."""
+    return not any(bgra[0::16]) and not any(bgra[1::16]) and not any(bgra[2::16])
 
 
 def _validated_window(window_id: int | str) -> tuple[int, dict[str, Any]]:
@@ -620,21 +696,13 @@ def _window_token(hwnd: int, window: dict[str, Any]) -> str:
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
 
 
-def winapps_window_screenshot(window_id: int, expected_token: str | None = None) -> bytes:
-    """Capture a window with a bounded app paint request and safe visible-pixel fallback."""
-    if sys.platform != "win32" or _user32 is None or _gdi32 is None:
-        raise WinAppError("Native Windows app mirror needs a Windows host")
-    hwnd, window = _validated_window(window_id)
-    identity = _window_identity(hwnd, window)
-    if expected_token and _window_token(hwnd, window) != expected_token:
-        raise WinAppError("The selected window changed; refresh the mirror",
-                          status=409, code="WINDOW_CHANGED")
+def _capture_window(hwnd: int, window: dict[str, Any]) -> bytes:
     width, height = window["width"], window["height"]
-
     screen_dc = _user32.GetWindowDC(hwnd)
     if not screen_dc:
         raise WinAppError("Could not open the window display context")
     memory_dc = bitmap = None
+    old_bitmap = None
     try:
         memory_dc = _gdi32.CreateCompatibleDC(screen_dc)
         bitmap = _gdi32.CreateCompatibleBitmap(screen_dc, width, height)
@@ -643,17 +711,44 @@ def winapps_window_screenshot(window_id: int, expected_token: str | None = None)
         old_bitmap = _gdi32.SelectObject(memory_dc, bitmap)
         if not old_bitmap:
             raise WinAppError("Could not select the window capture surface")
-        _gdi32.PatBlt(memory_dc, 0, 0, width, height, 0x00000042)
-        rendered = _send_bounded_window_print(hwnd, memory_dc)
+        pixels = None
+        rendered = False
+        if hasattr(_user32, "PrintWindow"):
+            for flags in (0, PW_RENDERFULLCONTENT):
+                if hasattr(_gdi32, "PatBlt"):
+                    _gdi32.PatBlt(memory_dc, 0, 0, width, height, 0x00000042)
+                if _user32.PrintWindow(hwnd, memory_dc, flags):
+                    try:
+                        px = _bitmap_pixels(memory_dc, bitmap, old_bitmap, width, height)
+                        if not _black_frame(px):
+                            pixels = px
+                            rendered = True
+                            break
+                    except WinAppError:
+                        pass
         if not rendered:
-            if not _window_unoccluded(hwnd, window):
-                raise WinAppError(
-                    "The window did not respond to capture before the timeout and is covered; uncover it and retry",
-                    status=504,
-                )
-            if not _capture_desktop_fallback(memory_dc, window):
-                raise WinAppError("The window capture timed out and desktop fallback failed", status=504)
-        pixels = _bitmap_pixels(memory_dc, bitmap, old_bitmap, width, height)
+            if hasattr(_gdi32, "PatBlt"):
+                _gdi32.PatBlt(memory_dc, 0, 0, width, height, 0x00000042)
+            rendered = _send_bounded_window_print(hwnd, memory_dc)
+            if rendered:
+                try:
+                    px = _bitmap_pixels(memory_dc, bitmap, old_bitmap, width, height)
+                    if not _black_frame(px):
+                        pixels = px
+                except WinAppError:
+                    pass
+            if pixels is None:
+                if not _window_unoccluded(hwnd, window):
+                    raise WinAppError(
+                        "The covered window did not respond to capture before the timeout; uncover it and retry",
+                        status=504,
+                    )
+                if not _capture_desktop_fallback(memory_dc, window):
+                    raise WinAppError("The window capture timed out and desktop fallback failed", status=504)
+                pixels = _bitmap_pixels(memory_dc, bitmap, old_bitmap, width, height)
+        if pixels is None:
+            raise WinAppError("Could not capture that window; try another application window")
+        return pixels
     finally:
         if bitmap:
             if memory_dc and old_bitmap:
@@ -662,14 +757,27 @@ def winapps_window_screenshot(window_id: int, expected_token: str | None = None)
         if memory_dc:
             _gdi32.DeleteDC(memory_dc)
         _user32.ReleaseDC(hwnd, screen_dc)
-    result = _png(width, height, pixels)
-    validate_png_frame(result)
-    current_hwnd, current_window = _validated_window(hwnd)
-    if current_hwnd != hwnd or _window_identity(hwnd, current_window) != identity \
-            or (expected_token and _window_token(hwnd, current_window) != expected_token):
-        raise WinAppError("The selected window changed during capture; refresh the mirror",
-                          status=409, code="WINDOW_CHANGED")
-    return result
+
+
+def winapps_window_screenshot(window_id: int | str, expected_token: str | None = None) -> bytes:
+    """Capture a visible window in physical pixels, retrying PrintWindow with full content and safe fallback."""
+    if sys.platform != "win32" or _user32 is None or _gdi32 is None:
+        raise WinAppError("Native Windows app mirror needs a Windows host")
+    with _physical_dpi_context():
+        hwnd, window = _validated_window(window_id)
+        identity = _window_identity(hwnd, window)
+        if expected_token and _window_token(hwnd, window) != expected_token:
+            raise WinAppError("The selected window changed; refresh the mirror",
+                              status=409, code="WINDOW_CHANGED")
+        pixels = _capture_window(hwnd, window)
+        result = _png(window["width"], window["height"], pixels)
+        validate_png_frame(result)
+        current_hwnd, current_window = _validated_window(hwnd)
+        if current_hwnd != hwnd or _window_identity(hwnd, current_window) != identity \
+                or (expected_token and _window_token(hwnd, current_window) != expected_token):
+            raise WinAppError("The selected window changed during capture; refresh the mirror",
+                              status=409, code="WINDOW_CHANGED")
+        return result
 
 
 def winapps_window_stream(
@@ -1240,6 +1348,20 @@ def _record_audit(kind: str, *, window: dict[str, Any] | None = None,
         del _AUDIT_ROWS[:-CONTROL_AUDIT_MAX]
 
 
+def _audit_summary_locked() -> list[dict[str, Any]]:
+    fields = ("time", "kind", "action", "windowId", "app", "x", "y", "deltaX",
+              "deltaY", "textLength", "key", "ok")
+    return [
+        {key: row[key] for key in fields if key in row}
+        for row in _AUDIT_ROWS[-CONTROL_AUDIT_DISPLAY_MAX:]
+    ]
+
+
+def _audit_summary() -> list[dict[str, Any]]:
+    with _AUDIT_LOCK:
+        return _audit_summary_locked()
+
+
 def _control_active_locked(now: float) -> bool:
     if _CONTROL_STATE["armed"] and now - _CONTROL_STATE["armedAt"] < CONTROL_TIMEOUT_SECONDS:
         return True
@@ -1258,7 +1380,14 @@ def winapps_control_state() -> dict[str, Any]:
             {key: row[key] for key in ("time", "kind", "windowId", "app", "ok", "reason") if key in row}
             for row in _AUDIT_ROWS[-10:]
         ]
-    return {"armed": armed, "owner": owner, "expiresInSec": expires, "audit": audit}
+        recent_actions = _audit_summary_locked()
+    return {
+        "armed": armed,
+        "owner": owner,
+        "expiresInSec": expires,
+        "audit": audit,
+        "recentActions": recent_actions,
+    }
 
 
 def _validated_owner(owner: Any) -> str:
@@ -1359,6 +1488,62 @@ def _focus_window(hwnd: int, expected_token: str | None = None) -> None:
                       status=409, code="FOCUS_FAILED")
 
 
+def _mouse_absolute_position(hwnd: int, x: int, y: int, window: dict[str, Any]) -> tuple[int, int]:
+    screen_x, screen_y = window["x"] + x, window["y"] + y
+    if not (window["x"] <= screen_x < window["x"] + window["width"]
+            and window["y"] <= screen_y < window["y"] + window["height"]):
+        raise WinAppError("Mouse coordinates fall outside the selected window")
+    with _physical_dpi_context():
+        screen_left, screen_top = _user32.GetSystemMetrics(76), _user32.GetSystemMetrics(77)
+        screen_width, screen_height = _user32.GetSystemMetrics(78), _user32.GetSystemMetrics(79)
+        if screen_width <= 1 or screen_height <= 1:
+            raise WinAppError("Windows did not report valid desktop bounds", status=503)
+        target = _user32.WindowFromPoint(_POINT(screen_x, screen_y))
+        if not target or _user32.GetAncestor(target, GA_ROOT) != hwnd:
+            raise WinAppError("The target point is covered by another window; refresh and retry", status=409)
+    absolute_x = round((screen_x - screen_left) * 65535 / (screen_width - 1))
+    absolute_y = round((screen_y - screen_top) * 65535 / (screen_height - 1))
+    return absolute_x, absolute_y
+
+
+def _send_mouse_gesture(hwnd: int, x: int, y: int, window: dict[str, Any], action: str,
+                        delta_x: int = 0, delta_y: int = 0) -> None:
+    absolute_x, absolute_y = _mouse_absolute_position(hwnd, x, y, window)
+    events: list[_INPUT] = [_INPUT()]
+    events[0].type = 0
+    events[0].mi = _MOUSEINPUT(
+        absolute_x, absolute_y, 0,
+        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, 0, 0,
+    )
+    if action in ("click", "double_click"):
+        count = 2 if action == "double_click" else 1
+        for _ in range(count):
+            for flag in (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP):
+                event = _INPUT()
+                event.type = 0
+                event.mi = _MOUSEINPUT(absolute_x, absolute_y, 0, flag, 0, 0)
+                events.append(event)
+    elif action == "right_click":
+        for flag in (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP):
+            event = _INPUT()
+            event.type = 0
+            event.mi = _MOUSEINPUT(absolute_x, absolute_y, 0, flag, 0, 0)
+            events.append(event)
+    elif action == "scroll":
+        for delta, flag in ((delta_y, MOUSEEVENTF_WHEEL), (delta_x, MOUSEEVENTF_HWHEEL)):
+            if not delta:
+                continue
+            event = _INPUT()
+            event.type = 0
+            event.mi = _MOUSEINPUT(0, 0, delta & 0xFFFFFFFF, flag, 0, 0)
+            events.append(event)
+    else:
+        raise WinAppError("Unsupported mouse action")
+    inputs = (_INPUT * len(events))(*events)
+    if _user32.SendInput(len(inputs), inputs, ctypes.sizeof(_INPUT)) != len(inputs):
+        raise WinAppError("Windows did not accept the mouse input", status=503)
+
+
 def _ensure_foreground_target(hwnd: int, expected_token: str) -> dict[str, Any]:
     _current, window = _visible_window(hwnd)
     if _window_token(hwnd, window) != expected_token:
@@ -1396,14 +1581,15 @@ def _send_mouse_action(
     if not (window["x"] <= rect_x < window["x"] + window["width"]
             and window["y"] <= rect_y < window["y"] + window["height"]):
         raise WinAppError("Click coordinates fall outside the selected window")
-    screen_left, screen_top = _user32.GetSystemMetrics(76), _user32.GetSystemMetrics(77)
-    screen_width, screen_height = _user32.GetSystemMetrics(78), _user32.GetSystemMetrics(79)
-    if screen_width <= 1 or screen_height <= 1:
-        raise WinAppError("Windows did not report valid desktop bounds", status=503)
-    point = _POINT(rect_x, rect_y)
-    target = _user32.WindowFromPoint(point)
-    if not target or _user32.GetAncestor(target, GA_ROOT) != hwnd:
-        raise WinAppError("The target point is covered by another window; refresh and retry", status=409)
+    with _physical_dpi_context():
+        screen_left, screen_top = _user32.GetSystemMetrics(76), _user32.GetSystemMetrics(77)
+        screen_width, screen_height = _user32.GetSystemMetrics(78), _user32.GetSystemMetrics(79)
+        if screen_width <= 1 or screen_height <= 1:
+            raise WinAppError("Windows did not report valid desktop bounds", status=503)
+        point = _POINT(rect_x, rect_y)
+        target = _user32.WindowFromPoint(point)
+        if not target or _user32.GetAncestor(target, GA_ROOT) != hwnd:
+            raise WinAppError("The target point is covered by another window; refresh and retry", status=409)
     absolute_x = round((rect_x - screen_left) * 65535 / (screen_width - 1))
     absolute_y = round((rect_y - screen_top) * 65535 / (screen_height - 1))
     events: list[_INPUT] = []
@@ -1429,9 +1615,10 @@ def _send_mouse_action(
         raise WinAppError("action must be click, double_click, right_click or scroll")
     batch = (_INPUT * len(events))(*events)
     _ensure_foreground_target(hwnd, expected_token)
-    target = _user32.WindowFromPoint(point)
-    if not target or _user32.GetAncestor(target, GA_ROOT) != hwnd:
-        raise WinAppError("The target point is covered by another window; refresh and retry", status=409)
+    with _physical_dpi_context():
+        target = _user32.WindowFromPoint(point)
+        if not target or _user32.GetAncestor(target, GA_ROOT) != hwnd:
+            raise WinAppError("The target point is covered by another window; refresh and retry", status=409)
     sent = _user32.SendInput(len(events), batch, ctypes.sizeof(_INPUT))
     if sent != len(events):
         release: list[_INPUT] = []
@@ -1575,8 +1762,32 @@ def _validated_click(data: dict[str, Any]) -> dict[str, Any]:
 
 def _validated_input(data: dict[str, Any]) -> dict[str, Any]:
     values = _validated_action_binding(data)
-    values["kind"] = data.get("kind")
-    if values["kind"] == "type":
+    kind = data.get("kind")
+    if not isinstance(kind, str):
+        raise WinAppError("kind must be type, key, double_click, right_click, or scroll")
+    if kind in ("double", "right"):
+        kind = {"double": "double_click", "right": "right_click"}[kind]
+    values["kind"] = kind
+
+    if values["kind"] in INPUT_MOUSE_KINDS:
+        for k in ("x", "y"):
+            value = data.get(k)
+            if type(value) is not int:
+                raise WinAppError(f"{k} must be an integer")
+            values[k] = value
+        bounds = values["elementBounds"]
+        if not (bounds["x"] <= values["x"] < bounds["x"] + bounds["w"]
+                and bounds["y"] <= values["y"] < bounds["y"] + bounds["h"]):
+            raise WinAppError("Mouse coordinates must fall inside the previewed UI Automation control")
+        if values["kind"] == "scroll":
+            for k in ("deltaX", "deltaY"):
+                value = data.get(k)
+                if type(value) is not int or abs(value) > MAX_SCROLL_DELTA:
+                    raise WinAppError(f"{k} must be an integer between {-MAX_SCROLL_DELTA} and {MAX_SCROLL_DELTA}")
+                values[k] = value
+            if not values["deltaX"] and not values["deltaY"]:
+                raise WinAppError("scroll requires a non-zero deltaX or deltaY")
+    elif values["kind"] == "type":
         text = data.get("text")
         if not isinstance(text, str) or not 1 <= len(text) <= MAX_INPUT_TEXT_CHARS \
                 or not all(char.isprintable() and unicodedata.category(char) not in ("Cc", "Cf", "Cs")
@@ -1589,7 +1800,7 @@ def _validated_input(data: dict[str, Any]) -> dict[str, Any]:
             raise WinAppError("key must be one of: " + ", ".join(INPUT_KEYS))
         values["key"] = key
     else:
-        raise WinAppError("kind must be type or key")
+        raise WinAppError("kind must be type, key, double_click, right_click, or scroll")
     return values
 
 
@@ -1726,14 +1937,25 @@ def winapps_control_click(data: dict[str, Any]) -> dict[str, Any]:
                 "fingerprint": fingerprint, "state": "done", "result": result,
             })
         _record_audit("click", window=window, detail={
-            "x": values["x"], "y": values["y"], "action": values["action"],
-            "actionId": values["actionId"], "ok": True,
+            "action": values.get("action", "click"),
+            "x": values["x"],
+            "y": values["y"],
+            "actionId": values.get("actionId"),
+            "deltaX": values.get("deltaX"),
+            "deltaY": values.get("deltaY"),
+            "ok": True,
         })
         return result
     except WinAppError as exc:
         _record_audit("click", window=window, detail={
-            "x": values.get("x"), "y": values.get("y"), "action": values.get("action"),
-            "actionId": values.get("actionId"), "ok": False, "reason": str(exc)[:120],
+            "action": values.get("action", "click"),
+            "x": values.get("x"),
+            "y": values.get("y"),
+            "actionId": values.get("actionId"),
+            "deltaX": values.get("deltaX"),
+            "deltaY": values.get("deltaY"),
+            "ok": False,
+            "reason": str(exc)[:120],
         })
         raise
 
@@ -1750,15 +1972,24 @@ def winapps_control_input(data: dict[str, Any]) -> dict[str, Any]:
             _require_control_locked(values["owner"], data.get("confirm"))
             hwnd, window = _visible_window(values["windowId"])
             window, elements, element = _validated_action_snapshot(hwnd, window, values)
-            _uia_read_elements_bounded(
-                hwnd, window, focus_element_id=values["elementId"],
-                expected_revision=values["revision"], expected_bounds=values["elementBounds"],
-            )
+            is_mouse = values["kind"] in INPUT_MOUSE_KINDS
+            if is_mouse:
+                if not 0 <= values["x"] < window["width"] or not 0 <= values["y"] < window["height"]:
+                    raise WinAppError("Mouse coordinates are outside the selected window")
+                _focus_window(hwnd, values["windowToken"])
+            else:
+                _uia_read_elements_bounded(
+                    hwnd, window, focus_element_id=values["elementId"],
+                    expected_revision=values["revision"], expected_bounds=values["elementBounds"],
+                )
             hwnd, window = _visible_window(hwnd)
             if _window_token(hwnd, window) != values["windowToken"]:
                 raise WinAppError("The selected window changed; review the action again",
                                   status=409, code="WINDOW_CHANGED")
             current_elements, _trimmed = _uia_read_elements_bounded(hwnd, window)
+            if is_mouse and not _same_ui_except_focus(elements, current_elements):
+                raise WinAppError("The UI changed while focusing the selected window; review it again",
+                                  status=409, code="UIA_STALE")
             current_element = next(
                 (candidate for candidate in current_elements
                  if candidate["elementId"] == values["elementId"]), None
@@ -1766,16 +1997,26 @@ def winapps_control_input(data: dict[str, Any]) -> dict[str, Any]:
             if current_element is None or any(
                 current_element[field] != element[field]
                 for field in ("role", "label", "x", "y", "w", "h", "enabled")
-            ) or not current_element["enabled"] or not current_element["focused"]:
+            ) or not current_element["enabled"]:
+                raise WinAppError("The previewed UI Automation control changed; review it again",
+                                  status=409, code="UIA_TARGET_CHANGED")
+            if not is_mouse and not current_element["focused"]:
                 raise WinAppError("Windows could not focus the previewed UI Automation control",
                                   status=409, code="FOCUS_FAILED")
             _require_control_locked(values["owner"], data.get("confirm"))
             _store_action_locked(key, {"fingerprint": fingerprint, "state": "pending"})
             try:
-                _send_keyboard_input(
-                    hwnd, values["kind"], values.get("text"), values.get("key"),
-                    values["windowToken"], current_element,
-                )
+                if is_mouse:
+                    _send_mouse_action(
+                        hwnd, values["x"], values["y"], values["kind"],
+                        values.get("deltaX", 0), values.get("deltaY", 0),
+                        values["windowToken"], current_element,
+                    )
+                else:
+                    _send_keyboard_input(
+                        hwnd, values["kind"], values.get("text"), values.get("key"),
+                        values["windowToken"], current_element,
+                    )
             except WinAppError as exc:
                 _store_action_locked(key, {
                     "fingerprint": fingerprint, "state": "error",
@@ -1790,9 +2031,14 @@ def winapps_control_input(data: dict[str, Any]) -> dict[str, Any]:
             _CONTROL_STATE["armedAt"] = time.monotonic()
             detail = {
                 "kind": values["kind"],
+                "action": values["kind"],
                 "ok": True,
                 "textLength": len(values.get("text", "")),
                 "key": values.get("key"),
+                "x": values.get("x"),
+                "y": values.get("y"),
+                "deltaX": values.get("deltaX"),
+                "deltaY": values.get("deltaY"),
                 "actionId": values["actionId"],
             }
             result = {"ok": True, "actionSent": True, "windowId": hwnd, **detail}
@@ -1804,7 +2050,13 @@ def winapps_control_input(data: dict[str, Any]) -> dict[str, Any]:
     except WinAppError as exc:
         _record_audit("input", window=window, detail={
             "kind": values.get("kind"), "textLength": len(values.get("text", "")),
-            "key": values.get("key"), "actionId": values.get("actionId"),
+            "action": values.get("kind"),
+            "key": values.get("key"),
+            "x": values.get("x"),
+            "y": values.get("y"),
+            "deltaX": values.get("deltaX"),
+            "deltaY": values.get("deltaY"),
+            "actionId": values.get("actionId"),
             "ok": False, "reason": str(exc)[:120],
         })
         raise

@@ -258,6 +258,7 @@ def test_winapps_uia_routes_return_elements_search_and_explicit_errors(web_serve
     })
     monkeypatch.setattr(web_ui.winapps, "winapps_control_state", lambda: {
         "armed": False, "owner": None, "expiresInSec": 0,
+        "recentActions": [{"time": 1.0, "kind": "input", "action": "double_click", "ok": True}],
     })
 
     data = json.loads(urllib.request.urlopen(
@@ -273,6 +274,7 @@ def test_winapps_uia_routes_return_elements_search_and_explicit_errors(web_serve
         f"{web_server}/api/labs/winapps/control"
     ).read().decode("utf-8"))
     assert control["armed"] is False
+    assert control["recentActions"][0]["action"] == "double_click"
 
     def unsupported(_hwnd, _revision, _token=None):
         raise web_ui.winapps.WinAppError("UI Automation is unavailable", status=501, code="UIA_UNAVAILABLE")
@@ -291,7 +293,7 @@ def test_winapps_control_post_routes_require_header_and_dispatch_actions(web_ser
 
     def arm(armed, owner):
         calls.append(("arm", armed, owner))
-        return {"armed": armed, "owner": owner, "expiresInSec": 600}
+        return {"armed": armed, "owner": owner, "expiresInSec": 600, "recentActions": []}
 
     def click(data):
         calls.append(("click", data))
@@ -324,17 +326,25 @@ def test_winapps_control_post_routes_require_header_and_dispatch_actions(web_ser
     status, rejected = _post(f"{web_server}/api/labs/winapps/control", arm_payload)
     assert status == 403 and "X-OSLab" in rejected["error"]
     headers = {"X-OSLab": "1"}
+    input_double_click_payload = {**binding, "kind": "double_click", "x": 4, "y": 5, "actionId": "action-3"}
+    input_scroll_payload = {**binding, "kind": "scroll", "x": 4, "y": 5, "deltaX": 0, "deltaY": 120, "actionId": "action-4"}
     assert _post(f"{web_server}/api/labs/winapps/control", arm_payload, headers)[0] == 200
     assert _post(f"{web_server}/api/labs/winapps/click", click_payload, headers)[0] == 200
     assert _post(f"{web_server}/api/labs/winapps/input", input_payload, headers)[0] == 200
+    assert _post(f"{web_server}/api/labs/winapps/input", input_double_click_payload, headers)[0] == 200
+    assert _post(f"{web_server}/api/labs/winapps/input", input_scroll_payload, headers)[0] == 200
     assert _post(f"{web_server}/api/labs/winapps/stop", {}, headers)[0] == 200
-    assert [call[0] for call in calls] == ["arm", "click", "input", "stop"]
+    assert [call[0] for call in calls] == ["arm", "click", "input", "input", "input", "stop"]
     assert calls == [
         ("arm", True, "panel"),
         ("click", click_payload),
         ("input", input_payload),
+        ("input", input_double_click_payload),
+        ("input", input_scroll_payload),
         ("stop",),
     ]
+    assert calls[3][1]["kind"] == "double_click"
+    assert calls[4][1]["deltaY"] == 120
 
 
 def test_winapps_control_post_preserves_validation_status(web_server, monkeypatch):

@@ -1,6 +1,6 @@
 /**
  * Windows Apps Lab mirror: a draggable, resizable view of one real desktop window.
- * The mirror keeps capture, UI Automation and guarded input tied to one window.
+ * The mirror keeps capture, UI Automation and guarded input tied to one window; input is opt-in, previewed, confirmed, and guarded by the backend arm lock.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -8,7 +8,7 @@ import {
 } from "@phosphor-icons/react";
 import { Badge, Empty, Field, Modal, Skeleton, Status } from "../components/ui";
 import {
-  api, message, usePoll, type WinActionBinding, type WinApp, type WinAppsInfo,
+  api, message, usePoll, type WinActionBinding, type WinApp, type WinAppsInfo, type WinAuditRow,
   type WinControlState, type WinElement, type WinElementsInfo, type WinInputKey
 } from "../lib/api";
 
@@ -26,6 +26,15 @@ const MAX_CAPTURE_PIXELS = 7680 * 4320;
 const MAX_STREAM_FRAME_BYTES = MAX_CAPTURE_PIXELS * 4 + 1024 * 1024;
 const MAX_STREAM_HEADER_BYTES = 16_384;
 const MAX_SCROLL_DELTA = 1200;
+
+const MOUSE_ACTIONS = ["click", "double_click", "right_click", "scroll"] as const;
+type MouseAction = typeof MOUSE_ACTIONS[number];
+const MOUSE_ACTION_LABELS: Record<MouseAction, string> = {
+  click: "Click",
+  double_click: "Double-click",
+  right_click: "Right-click",
+  scroll: "Scroll"
+};
 
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 
@@ -270,6 +279,22 @@ function labelFor(app: WinApp): string {
   return `${app.app}${title}`;
 }
 
+function auditLabel(row: WinAuditRow): string {
+  const action = row.action ?? row.kind;
+  const labels: Record<string, string> = {
+    arm: "Arm control",
+    disarm: "Disarm control",
+    "panic-stop": "Panic stop",
+    click: "Click",
+    double_click: "Double-click",
+    right_click: "Right-click",
+    scroll: "Scroll",
+    type: "Type text",
+    key: "Press key"
+  };
+  return labels[action] ?? "Action";
+}
+
 function constrainPanel(
   rect: { left: number; top: number; width: number; height: number },
   viewportWidth: number,
@@ -299,6 +324,8 @@ export function WinAppsPanel() {
   const [pos, setPos] = useState({ left: 0, top: 0, width: 440, height: 420 });
   const [showElements, setShowElements] = useState(false);
   const [query, setQuery] = useState("");
+  const [mouseAction, setMouseAction] = useState<MouseAction>("click");
+  const [scrollDeltaY, setScrollDeltaY] = useState(120);
   const [searchResult, setSearchResult] = useState<{
     windowId: number; windowToken: string; revision: string; query: string; hits: WinElement[];
   } | null>(null);
@@ -306,8 +333,6 @@ export function WinAppsPanel() {
   const [pending, setPending] = useState<PendingAction | null>(null);
   const [inputText, setInputText] = useState("");
   const [inputKey, setInputKey] = useState<WinInputKey>("tab");
-  const [mouseAction, setMouseAction] = useState<"click" | "double_click" | "right_click" | "scroll">("click");
-  const [scrollDeltaY, setScrollDeltaY] = useState(-120);
   const [actionError, setActionError] = useState<string | null>(null);
   const [controlBusy, setControlBusy] = useState(false);
   const [previewBusy, setPreviewBusy] = useState(false);
@@ -397,6 +422,7 @@ export function WinAppsPanel() {
     && searchResult.query === query.trim() ? searchResult : null;
   const hitIds = activeSearch ? new Set(activeSearch.hits.map((element) => element.elementId)) : null;
   const visibleElements = hitIds ? elements.filter((element) => hitIds.has(element.elementId)) : elements;
+  const recentActions = controlState?.recentActions ?? [];
 
   useEffect(() => {
     setPending(null);
@@ -785,6 +811,7 @@ export function WinAppsPanel() {
       }
       setPending(null);
       control.reload();
+      if (showElements) void requestElements();
     } catch (e) {
       setActionError(message(e));
       control.reload();
@@ -971,6 +998,24 @@ export function WinAppsPanel() {
             </>
           ) : null}
           <div className="grid gap-2 sm:grid-cols-2">
+            <Field label="Mouse action">
+              <select className="iux-input" value={mouseAction} aria-label="Mouse action"
+                onChange={(event) => setMouseAction(event.target.value as MouseAction)}>
+                {MOUSE_ACTIONS.map((action) => (
+                  <option key={action} value={action}>{MOUSE_ACTION_LABELS[action]}</option>
+                ))}
+              </select>
+            </Field>
+            {mouseAction === "scroll" ? (
+              <Field label="Scroll amount">
+                <input className="iux-input" type="number" min={-MAX_SCROLL_DELTA} max={MAX_SCROLL_DELTA}
+                  step={120} value={scrollDeltaY} aria-label="Scroll amount"
+                  onChange={(event) => {
+                    const value = Number(event.target.value);
+                    setScrollDeltaY(Number.isFinite(value) ? clamp(value, -MAX_SCROLL_DELTA, MAX_SCROLL_DELTA) : 0);
+                  }} />
+              </Field>
+            ) : null}
             <div className="flex items-end gap-2">
               <Field label="Text to type">
                 <input className="iux-input" value={inputText} maxLength={200} aria-label="Text to type"
@@ -994,38 +1039,24 @@ export function WinAppsPanel() {
               </button>
             </div>
           </div>
-          <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
-            <Field label="Pointer action">
-              <select className="iux-input" value={mouseAction} aria-label="Pointer action"
-                onChange={(event) => setMouseAction(event.target.value as typeof mouseAction)}>
-                <option value="click">Click</option>
-                <option value="double_click">Double-click</option>
-                <option value="right_click">Right-click</option>
-                <option value="scroll">Scroll</option>
-              </select>
-            </Field>
-            {mouseAction === "scroll" ? (
-              <Field label="Scroll amount">
-                <input className="iux-input" type="number" min={-MAX_SCROLL_DELTA} max={MAX_SCROLL_DELTA}
-                  step={120} value={scrollDeltaY} aria-label="Scroll amount"
-                  onChange={(event) => {
-                    const value = Number(event.target.value);
-                    setScrollDeltaY(Number.isFinite(value) ? clamp(value, -MAX_SCROLL_DELTA, MAX_SCROLL_DELTA) : 0);
-                  }} />
-              </Field>
-            ) : null}
-          </div>
-          {controlState?.audit?.length ? (
+          {((controlState?.recentActions?.length ?? 0) > 0 || (controlState?.audit?.length ?? 0) > 0) ? (
             <section aria-label="Recent actions" className="rounded-lg border border-(--iux-border) p-2">
               <h3 className="mb-1 text-xs font-semibold">Recent actions</h3>
-              <ul className="flex flex-col gap-1 text-xs text-(--iux-muted-foreground)">
-                {controlState.audit.slice(-5).reverse().map((entry, index) => (
-                  <li key={`${entry.time}-${entry.kind}-${index}`} className="flex justify-between gap-2">
-                    <span>{entry.kind}{entry.app ? ` · ${entry.app}` : ""}</span>
-                    <span>{new Date(entry.time * 1000).toLocaleTimeString()}</span>
+              <ol className="flex flex-col gap-1">
+                {(controlState?.recentActions ?? controlState?.audit ?? []).slice(-6).reverse().map((row, index) => (
+                  <li key={`${row.time}-${row.kind}-${index}`} className="flex items-center gap-2 text-xs">
+                    <span className="min-w-0 flex-1 truncate">
+                      {auditLabel(row)}{row.key ? ` · ${row.key}` : ""}{row.app ? ` · ${row.app}` : ""}
+                    </span>
+                    <span className={row.ok === false ? "text-(--iux-danger)" : "text-(--iux-muted-foreground)"}>
+                      {row.ok === false ? "Blocked" : "Sent"}
+                    </span>
+                    <time dateTime={new Date(row.time * 1000).toISOString()}>
+                      {new Date(row.time * 1000).toLocaleTimeString()}
+                    </time>
                   </li>
                 ))}
-              </ul>
+              </ol>
             </section>
           ) : null}
           <div

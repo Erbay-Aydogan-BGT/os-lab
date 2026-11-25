@@ -112,21 +112,25 @@ not trigger polling. The floating panel clamps drag and resize bounds to the
 viewport and its contents remain scrollable on narrow screens.
 
 Control is separate and opt-in: `/control` grants one local owner a ten-minute
-lock, renewed after confirmed actions. Click and keyboard input require the
-lock, a confirmation, a current window identity and UIA revision, plus a
-foreground check immediately before delivery. Focus is requested through UI
-Automation; the console does not force foreground with `SetForegroundWindow`
-or `BringWindowToTop`, and rejects the action if the target is not foreground.
-Hotspot clicks are bound to a visible element ID and bounds; text and key input
-are bound to the previewed focused element. `/click` supports single, double,
-right-click and bounded scroll actions; `/input` accepts printable text or the
-restricted navigation key allowlist. Window identity tokens accompany captures,
-UIA reads, and actions so a recycled HWND cannot silently retarget an existing
-mirror or approval. Each confirmed action has a bounded idempotency key and is
-rejected if its UIA revision or control bounds changed after preview. The dashboard
-previews each target in a confirmation dialog; Enter is explicitly called out
-because it can submit a form. A panic-stop endpoint disarms the lock and ends
-active mirror streams. The `/control` status includes a short safe audit
+lock, renewed after confirmed actions, and returns a bounded recent-action
+summary. Click and keyboard input require the lock, a confirmation, a current
+window identity and UIA revision, plus a foreground check immediately before
+delivery. Focus is requested through UI Automation; the console does not force
+foreground with `SetForegroundWindow` or `BringWindowToTop`, and rejects the
+action if the target is not foreground. Hotspot clicks are bound to a visible
+element ID and bounds; text and key input are bound to the previewed focused
+element. `/click` supports single, double, right-click and bounded scroll
+actions; `/input` accepts printable text, the restricted navigation key
+allowlist, or UIA-bound double-click, right-click and bounded scroll actions. Window identity tokens accompany captures, UIA reads, and actions
+so a recycled HWND cannot silently retarget an existing mirror or approval.
+Each confirmed action has a bounded idempotency key and is rejected if its UIA
+revision or control bounds changed after preview. The dashboard previews each
+target in a confirmation dialog; Enter is explicitly called out because it can
+submit a form. Win32 bounds, UIA rectangles, capture pixels and pointer
+coordinates share a per-monitor-aware physical-pixel space. Capture retries
+`PrintWindow(PW_RENDERFULLCONTENT)` and permits desktop blit fallback only
+when the target is not overlapped. A panic-stop endpoint disarms the lock and
+ends active mirror streams. The `/control` status includes a short safe audit
 summary; it never includes typed text or window titles. Input auditing is
 bounded. Mutating requests continue to require the console's localhost/Host
 validation and `X-OSLab: 1`.
