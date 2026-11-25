@@ -93,7 +93,9 @@ new device profile.
 | `install APK=` | copy APK into `apks/` and `adb install -r` |
 | `wf1 APK=` | static workflow (MobSF + JADX) |
 | `wf2 APK= [PKG=]` | dynamic workflow (emulator + mitm + frida) |
+| `pinning APK=` | PENT-11: static SSL-pinning detector/classifier (run before `wf2`) |
 | `hook PKG= HOOK=` | attach a Frida hook to a running app |
+| `trace [PKG=] [GLOB=]` | run `frida-trace` auto-tracer (`hooks/trace_runner.py`) and save JSON call map + session log |
 | `report` | collect logs/status/flows into `artifacts/` |
 | `clean` | wipe `artifacts/` |
 
@@ -113,12 +115,14 @@ lab/
 │   ├── wait-boot.sh       # poll device_status until "ready"
 │   ├── wf1-static.sh      # MobSF upload → scan → PDF/JSON → jadx
 │   ├── wf2-dynamic.sh     # boot → install → proxy → frida-server
+│   ├── pinning_detector.py # PENT-11 static SSL/certificate-pinning classifier
 │   ├── report.sh          # artifact sweep
 │   ├── install-service.sh # systemd unit for boot start
 │   └── uninstall-service.sh
-├── hooks/                 # Frida scripts (educational bypasses)
+├── hooks/                 # Frida scripts (educational bypasses & auto-tracer)
 │   ├── ssl-pinning-bypass.js
-│   └── root-detection-bypass.js
+│   ├── root-detection-bypass.js
+│   └── trace_runner.py    # frida-trace wrapper & JSON call-map builder (PENT-06)
 ├── apks/                  # drop APKs here (gitignored)
 ├── frida/                 # drop frida-server-<ver>-android-x86_64 here (gitignored)
 └── artifacts/             # all reports, sources, captures (gitignored)

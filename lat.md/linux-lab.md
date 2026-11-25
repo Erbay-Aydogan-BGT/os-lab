@@ -36,9 +36,213 @@ expected, network containment is documented in
 [[linux-lab/knowledge/networking.md]] and worked workflows in
 [[linux-lab/knowledge/usecases.md]].
 
+## Server first-look diagnostics (OS-16)
+
+[[linux-lab/scripts/server_firstlook.py]] reports Linux guest facts without
+changing the system or requiring sudo.
+
+It runs fixed argument lists for uname, lsb_release, inxi (CPU only),
+free, local df and systemctl service listing, with locale-independent parsing and
+per-command timeouts. Each subprocess call has literal arguments and disables
+the shell; unknown command names are rejected. It needs only Python's standard
+library and no sudo.
+
+Readable text and JSON expose kernel/architecture, distro, CPU, memory bytes,
+local mount usage and loaded service states. An architecture note distinguishes
+kernel names from distribution package names. Missing tools, failed commands,
+unrecognized output and timeouts stay explicit; unavailable service data is null,
+not an empty healthy list. Exit 0 means report generation, not a health verdict.
+Empty or unknown service states and malformed distro/CPU fields produce partial
+reports. Zero-sized disks may have null usage percentages. ASCII-only stdout
+uses character escapes; JSON preserves the original values on decoding.
+Nothing is installed, changed, automatically saved or sent over the network.
+
+[[android-lab/lab/tests/test_server_firstlook.py]] covers normal output, missing
+tools, timeouts, malformed tables, failed/non-systemd services, empty/unknown
+service states, distro/CPU validation, zero-sized disks, ASCII stdout, fixed
+command execution, JSON and CLI errors.
+[[linux-lab/docs/OS-16/VERIFY.md]] describes lab reproduction and evidence capture.
+
+## Permission and ownership audit
+
+[[linux-lab/scripts/permission_audit.py]] audits an owned lab tree's Unix modes
+and UID/GID against configurable limits. It reports world-write, excess bits,
+privileged regular files and ownership drift as text or JSON without applying fixes.
+
+Directory-relative stats and `fwalk` do not follow symlinks. Other filesystems
+and special files are counted as skipped; access errors and the entry budget
+make coverage incomplete. Exit codes are 0 clean, 1 findings, 2 incomplete/usage.
+
+The mode masks default to 0644/0755 and owner to the current UID; group is opt-in.
+Directory sticky/setgid semantics are preserved in suggestions. ACLs and file
+contents are outside scope; the audit is not an atomic filesystem snapshot.
+
+Offline cases in [[android-lab/lab/tests/test_permission_audit.py]] cover rules,
+root changes, links, limits, failure reporting and read-only behavior.
+[[linux-lab/docs/OS-26/VERIFY.md]] supplies the reproducible lab and video steps.
+
+OS-26 review hardening normalizes byte paths with `fsdecode`, rejects filesystem
+root aliases by device/inode, and compares opened child directories with their
+previously observed identities before inspecting contents. Changed directories
+make coverage incomplete. Findings include device/inode and stale-path warnings;
+commands are manual examples, never race-safe remediation. Ownership commands
+precede chmod; setgid directory mode restoration is suggested after chown.
+At most 1000 combined finding/error records are retained, including a terminal
+limit error; reaching that budget stops the audit with exit 2. `fwalk` directory
+name lists remain a limitation for very wide directories; use small owned labs.
+
+
 ## Why qemux/qemu
 
 The engine was chosen to match the Windows and macOS labs' compose+web-viewer UX.
 
 Rationale and the alternatives considered (privileged containers, libvirt,
 Firecracker, gVisor) are recorded in [[linux-lab/knowledge/draft.md]].
+
+## OS-30 Ubuntu baseline checker and explicit repairs
+
+[[linux-lab/scripts/harden_check.py]] is the standard-library Python entry point
+requested by the roadmap. It provides a read-only audit and selected,
+consent-gated repairs.
+
+Both entry points accept unquoted `ID=ubuntu` and double-quoted `ID="ubuntu"`
+in `/etc/os-release`, without sourcing that file.
+
+Its default audit delegates to [[linux-lab/scripts/hardening.sh]] for local SSH,
+user/sudo, cached-update and UFW checks; text or versioned JSON reports preserve
+WARN and FAIL evidence. A missing/empty collector or execution returning no
+findings is refused rather than treated as a clean audit.
+This runs inside an authorized Ubuntu guest (including ARM64 UTM), independently
+of the Docker VM host and its SSH forwarding port.
+
+Repair planning is read-only. Explicitly selected permission/timer/management-rule
+repairs require root and exact interactive consent immediately before application.
+Snapshots, metadata checks, no-follow file descriptors and a repair lock protect
+against drift and overlapping application. SSH authentication and ports are not
+changed; no package upgrades, UFW reset or automatic UFW activation occur. Failed
+permission/timer changes are rolled back. Failed or interrupted apply never
+automatically deletes UFW rules, including verified additions. Attempted
+additions retain the backup and manifest, with manual inspection required and
+the backup path reported.
+
+The allowlist and limitations are explained in [[linux-lab/knowledge/hardening.md]].
+[[linux-lab/tests/test_hardening.py]] and [[linux-lab/tests/test_harden_check.py]]
+use command fakes and temporary files.
+
+See [[linux-lab/os-30/VERIFY.md]] for test results and UTM verification.
+[[linux-lab/os-30/REPORT.md]] records the scope of the work.
+
+Completed schema-2 repair manifests record verified post-state for explicit
+`rollback ID`. The same lock and exact consent protect rollback; snapshot and
+post-state drift refuse permission/timer restoration. Only a uniquely tagged,
+proven run-owned UFW addition may be removed, with ambiguous firewall state
+reported as partial recovery. Legacy/incomplete evidence is not trusted.
+Rollback tests in [[linux-lab/tests/test_rollback.py]] use temporary files
+and fake commands.
+
+## OS-24 Local .deb Installer
+
+The OS-24 script installs local Debian packages on Ubuntu.
+
+Script: `linux-lab/scripts/os-24-deb-installer.sh`
+
+### Usage
+
+Install a local Debian package: the script validates it first, then hands
+it to apt.
+
+```bash
+./linux-lab/scripts/os-24-deb-installer.sh ./package.deb
+```
+
+### Behavior
+
+Validation and install steps, in order:
+
+- Requires exactly one package path.
+- Checks whether the file exists.
+- Requires a `.deb` file extension.
+- Validates the package using `dpkg-deb --info`.
+- Installs the package using `sudo apt install -y`.
+- Uses `realpath` to resolve the package's absolute path.
+
+### Safety
+
+Only install trusted `.deb` packages. Installation requires sudo
+permissions and may modify the operating system.
+
+## OS-23 salt okunur dpkg envanteri
+
+[[linux-lab/scripts/dpkg_inventory.py]], paket listesini, paket dosyalarını ve
+tam yoldan dosya sahipliğini sürümlü JSON olarak sunar.
+
+Paket durumu ile kurulu paket sayısı ayrı tutulur. Mimari ekleri korunur;
+dpkg arama jokerleri kaçırılır ve sonuç tam yolla karşılaştırılır. Araç sembolik
+bağlantıları çözmez, paketleri değiştirmez, root veya ağ erişimi istemez.
+Alternatif yönetim veritabanı, kopyalar ve sentetik testler için kullanılabilir.
+
+[[linux-lab/tests/test_dpkg_inventory.py]], komut hataları, girdi doğrulama
+ve ayrıştırma davranışlarını çevrimdışı sınar. dpkg varsa geçici sentetik
+veritabanında gerçek komutla bütünleşme testi de çalışır. Canlı Ubuntu
+kanıtıyla sentetik testlerin ayrımı [[linux-lab/os-23/VERIFY.md]] içinde açıklanır.
+
+## OS-29 Log Viewer
+
+[[linux-lab/scripts/log-viewer.sh]] is a menu helper that shows the first or last lines of a log, follows it, counts lines, pages through it and searches it.
+
+Log text is treated as untrusted: terminal control bytes are stripped before display. Missing or unreadable files stop with a message, end of input leaves the menu, and without a file argument it falls back to `journalctl` when `/var/log/syslog` is absent. [[linux-lab/tests/test_log_viewer.py]] covers these cases with temporary files.
+
+## OS-17 SSH Troubleshooter
+
+[[linux-lab/scripts/ssh_doctor.py]] classifies a pasted SSH error into timeout, authentication, loopback, firewall, adapter or unknown, and prints an explanation and a fix.
+
+Loopback (127.x.x.x, `::1`, `localhost`) is checked first because it is the real cause of many timeouts. A `--host` value with an IPv6 scope id or control bytes is rejected without being echoed. It never opens a connection or changes settings. [[linux-lab/tests/test_ssh_doctor.py]] covers the rules.
+
+## Shell basics exercise checker (OS-11)
+
+[[linux-lab/exercises/shell_basics_check.py]] checks a documented example
+directory exercise with per-path feedback and hints, without changing files.
+
+Each of ali, eda and aleyna contains odevler, sinavlar, sunumlar directories
+and a regular puan.txt file: 15 expected paths. Extra entries and empty files
+are allowed; content is not graded. This profile is not an official course mark.
+Child paths use directory descriptors and no-follow operations; symlinks and
+unreadable paths cannot pass. It is an observation, not an atomic tree snapshot.
+Text/JSON reports and interactive root entry are supported; exit 0 means all
+paths match, 1 means mismatches, 2 means invalid usage or an inaccessible root.
+[[android-lab/lab/tests/test_shell_basics_check.py]] exercises these contracts.
+[[linux-lab/docs/OS-11/VERIFY.md]] supplies reproducible lab commands.
+
+## PENT-05 Binary hardening and crash triage
+
+PENT-05 verifies compiler/linker mitigations on ELF binaries and triages AFL++ crashes.
+
+[[linux-lab/scripts/pent-05-hardening-audit.sh]] copies each binary to a private
+snapshot, then reads `readelf -h/-l/-d/-s` from that one copy. Per binary it reports
+NX (non-executable `GNU_STACK`), PIE (`DYN` with `INTERP` or a `FLAGS_1 PIE`
+flag, so static PIE counts; other `DYN` files are `dso`), stack canary
+(`__stack_chk_fail`), RELRO (`GNU_RELRO` + `BIND_NOW` = full), and FORTIFY
+(`__*_chk` count, informational). The system ASLR level comes from
+`/proc/sys/kernel/randomize_va_space` and only `2` passes; `--no-aslr-check`
+skips that gate. Exit 0 means all hardened, 1 means a weakness or ASLR not full,
+2 means a usage, file or tool error. `--json` escapes every control character.
+
+[[linux-lab/scripts/pent-05-afl-triage.sh]] has two modes. `triage` replays each
+crash input against a target (`@@` = file path, else stdin) under its own
+watchdog: a marker file records a real timeout, the target gets TERM and then
+KILL, and only the first 1 MB of output is inspected. Results are bucketed by
+ASAN error type plus the full names of the top two app frames, signal (exit
+status above 128), hang, `exit:N`, or no-crash. A target exiting with a status
+above 128 on its own is indistinguishable from a signal in the shell, which is
+acceptable because ASAN runs with `abort_on_error=1`. `fuzz` builds
+`linux-lab/pent-05/hedef.c` with `afl-cc` + ASAN, runs `afl-fuzz -m none -V N`
+into a fresh output directory, exits 1 if `afl-fuzz` fails, and triages the
+crashes. Progress goes to stderr, so `--json` stdout stays one JSON document.
+Without AFL++ it prints `[skip]` to stderr and exits 0.
+
+`linux-lab/pent-05/` holds the deliberately vulnerable lab target, seeds, and a
+Makefile that builds `hedef-weak` (all mitigations off) and `hedef-hardened`
+(all on); `make audit` requires exit 0 for the hardened binary and exactly 1 for
+the weak one. Offline tests in [[linux-lab/tests/pent05_test.sh]] use a fake
+`readelf` and a fake crash target; [[linux-lab/tests/test_pent05.py]] also parses
+both tools' `--json` output with `json.loads`.

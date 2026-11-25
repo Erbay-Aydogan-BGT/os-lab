@@ -15,20 +15,34 @@ The proposed extension and its tracked acceptance work are in the [UX guideline 
 
 - Derive setup actions from the current host report. Show **Install dependencies** only when a required prerequisite is missing and the lab exposes a `setup` action. The backend decides the `ready`, `needs-setup`, and `unavailable` states; do not infer readiness from the mere presence of an action.
 - Keep optional tooling separate. For example, a missing Appium installation can offer **Install Appium** without making an otherwise ready simulator appear blocked.
-- Preview lab actions before running them. A preview must state the command, effects, privileges, and downloads; execution starts only after confirmation.
+- Preview lab actions before running them. A preview must state the command, effects, privileges, and downloads; execution starts only after confirmation. The macOS app mirror follows this for every click; clicks skip the preview only while control mode is explicitly armed, and arming expires by itself after ten minutes.
 - Disable an action while its request is being submitted or a conflicting job is running. Put a failed request's error next to the action that failed.
 - Treat cancellation, log clearing, polling, and other follow-up requests the same way: show pending state, report failure beside the control or job, allow a safe retry, and trust the server for the final state. A failed cancellation must leave the running job and its output visible.
 - If no setup action exists, direct users to the relevant manual requirement or platform guidance instead of promising an unavailable install flow.
 
 ## Keep the default view compact and honest
 
-- Put configuration files, profiles, and endpoint addresses in a collapsed **Advanced settings** area on lab runtime pages. Keep required dependency status and primary actions visible.
+- Put configuration files, profiles, and endpoint addresses in a collapsed **Advanced settings** area on lab runtime pages. Keep required dependency status visible while anything is missing, and keep primary actions visible; once every tracked requirement is found, the Dependencies card may hide so the actions take the full row.
 - Describe an address as *configured* until the service is running. A known URL is not proof that it responds. Keep secondary Android endpoint lists collapsed and explain when they are usable.
 - Preserve a way to inspect details and copy addresses. Mask secrets before they reach the UI.
 - Use explicit loading, empty, success, and error states. Avoid cards that imply an operation succeeded before the API confirms it.
 - A Copy control reports success only after the clipboard write resolves. If it fails, keep the text available for manual selection. External release lookups must leave loading state after failure and retain an honest release-page fallback.
 - Label Source Lab evidence as live, imported, synthetic, or partial, and show its collection time where relevant. Missing tools, empty coverage, and an unavailable provider do not prove a clean live target. Keep private artifacts and secrets out of public Pages.
 - Keep standing guidance short when the nearby status and action already explain it. Preserve setup, security, download, privilege, cancellation, and evidence-limit warnings at the decision point.
+- Let long navigation collapse. The lab switcher (⌘L / Ctrl+L and the "Switch lab" sidebar card) focuses the sidebar on one lab with its live availability on each card; every lab stays reachable through Spotlight and direct links, and "All labs" restores the full list. Rarely used guides ("How to use") sit at the bottom of their group as collapsible entries, collapsed by default.
+
+## One-click standard
+
+Applies to every lab page; the rationale is in [`lat.md/ux-readiness.md`](../lat.md/ux-readiness.md) and the worked example is [Cleanup UX plan](CLEANUP_UX_PLAN.md). Copy this into the PR.
+
+- [ ] One primary action goes from nothing to a reviewed result; destructive steps end at the shared confirmation.
+- [ ] Everything else is a collapsed row with a one-line live summary; no ability was removed (add or keep a test that lists them all).
+- [ ] Defaults come from live state; user choices are stored on this computer, validated, and survive restart and app update (older/newer store versions are read, unknown ids are kept).
+- [ ] Limits are stated honestly (what is short, where to look next); safety classes are never bypassed.
+- [ ] Conditions that need action notify outside the window, escalate, repeat, and can be turned off.
+- [ ] An MCP tool exists for every new function (read-only tools, review that never applies, apply only with `confirm: true`, no raw paths or commands).
+- [ ] A shortcut for the primary action, visible focus, coarse-pointer targets, translations in every locale.
+- [ ] Unit, console and browser tests cover the logic, the endpoint, the one-click path and each collapsed row.
 
 ## Keep controls usable across devices
 

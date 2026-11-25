@@ -1,7 +1,8 @@
 # Dashboard
 
-The browser console: the host overview, every lab, and the Android Lab
-workbench, built from the qLar app shell (qLar PR #174).
+The browser console for the host, labs, and Android workbench.
+
+It is built from the qLar app shell (qLar PR #174).
 
 ## Architecture
 
@@ -9,13 +10,130 @@ A static Astro app in [[dashboard]] served by the Python console; there is no
 Node server at runtime.
 
 [[dashboard/src/shell/app-shell.tsx]] carries the sidebar (labs with their
-availability pills), Spotlight and theme ported from qLar. Pages are React
+availability pills), Spotlight and theme ported from qLar.
+[[dashboard/src/shell/lab-switcher.tsx]] is the ⌘L / Ctrl+L modal that sets the
+focused lab: a compact card per lab with its live availability, remembered in
+[[dashboard/src/shell/active-lab.ts]]. Firewall Lab is one of those labs. With a
+focus, the sidebar replaces the OS Lab group with a group named after the lab
+that lists its nav items; "All labs" in the switcher restores the full OS Lab
+list, and Spotlight keeps every lab listed. The Help group is collapsible,
+closed by default, opens itself when the current page is inside it, and
+remembers the choice in localStorage.
+Pages are React
 islands: [[dashboard/src/views/host-page.tsx]],
 [[dashboard/src/views/lab-page.tsx]], [[dashboard/src/views/jobs-page.tsx]],
 [[dashboard/src/views/contribute-page.tsx]] and
 the Android workbench in [[dashboard/src/views/android/pages.tsx]].
 [[dashboard/src/lib/api.ts]] is the typed client; it mirrors qLar's
 `shared/os-lab.ts` contract.
+
+## iOS Simulator panel
+
+When the iOS Lab is ready through the native-macos provider,
+[[dashboard/src/views/ios-simulator.tsx]] replaces the plain start/stop
+buttons with a device frame: a device picker, previewed attach/detach, a
+toggleable bezel and a live screen.
+
+The screen comes from the read-only `/api/labs/ios/simulator` and
+`/api/labs/ios/screenshot` endpoints. The panel still routes every state
+change through the previewed plan flow; the console validates the device
+against `xcrun simctl` (see [[ios-lab]]).
+
+## macOS app mirror
+
+When the macOS Lab is ready, [[dashboard/src/views/macos-app-mirror.tsx]]
+floats a draggable, resizable mirror of one real window on this Mac, fed by
+read-only endpoints under `/api/labs/macos/apps` (list, screenshot, stream,
+elements) and `/api/labs/macos/audit`.
+
+Mirror and hotspot clicks preview a `macos-click` action like any other;
+only while control mode is armed (an explicit toggle that disarms itself
+after ten minutes) do clicks land immediately through
+`/api/labs/macos/click`, which stays localhost-only like every other POST.
+The stream is multipart MJPEG with a poll fallback; the elements endpoint
+takes a `revision` query and powers a diff overlay. Right-click or
+long-press a hotspot for the input family (double, right, type, key —
+previewed `macos-input`, typing never sends Return), Deep inspect opens one
+armed-only mac2 session per app through `/api/labs/macos/session*` and
+routes hotspot actions through stable element ids, and the toolbar
+downloads the local audit log from `/api/labs/macos/audit.json`.
+
+The agent surface adds the native AX helper's values, focus and advertised
+actions to every hotspot (a priority trim, with the serving engine shown),
+a hotspot menu with set-value, advertised AX actions, scroll and paste,
+submit-class confirms for Enter and pastes even while armed, a persistent
+panic Stop, single-owner arming, and read-only windows/menu-bar/focused
+endpoints. `console/mcp_server.py` exposes the same guarded surface as a
+stdio MCP server — the model acts, the console guards, every step is
+audited. See [[ios-lab]] for permissions. The same server carries the Cleanup
+Lab tools, described in [[cleanup-lab#Dashboard pages#MCP tools (CUX-10)]].
+
+
+## macOS engine panel
+
+[[dashboard/src/views/macos-engine-panel.tsx]] sits under the mirror and shows
+engine state, permissions, displays, element search and a live audit feed.
+
+It reads `/api/labs/macos/{capabilities,permissions,displays}` and searches
+one window through `…/apps/<id>/search`. The only write is Request access
+(`POST …/permission/request`), which fires the Accessibility dialog or opens
+a Privacy pane. The feed is an opt-in `EventSource` on `…/events` that closes
+when switched off, hidden or unmounted.
+
+## Windows Apps Lab panel
+
+On Windows, `winapps` mirrors visible windows via `/api/labs/winapps/apps`,
+`/screenshot`, and multipart `/stream?fps=`. Its draggable panel supports
+resize, dock/hide, selection, stream fallback, and retry.
+
+The backend uses ctypes to enumerate visible, captioned top-level windows and
+captures one window with a bounded `WM_PRINT` request. An unresponsive app gets
+up to 1.5 seconds to paint; desktop-pixel fallback is used only when no higher
+window overlaps the target. Otherwise the API returns a timeout instead of
+blocking the console worker. The panel shows
+the selected window at its own aspect ratio, its dimensions and an `Elevated`
+badge when the owning process is elevated; only the newest capture updates the
+view. It is mounted only locally, is separate from the WSL2-backed VM lifecycle,
+and public Pages never mounts it. UI Automation endpoints expose at most 150
+visible, non-password controls with roles, labels and window-relative bounds;
+`/elements?revision=` returns bounded added/changed/removed diffs and `/search?q=`
+matches labels or roles with at most 50 results. The mirror can display and
+search these controls as clickable hotspots.
+
+The local panel also supports a draggable/resizable floating mirror, dock/hide,
+and a bounded multipart PNG stream at
+`/api/labs/winapps/apps/<hwnd>/stream?fps=` with a screenshot-poll fallback.
+At most two streams can capture at once. Each stream is bound to the selected
+window identity and ends if the HWND is recycled, the client disconnects, or
+the stream reaches its time limit. Multipart frames are validated PNGs and are
+capped to the largest capture dimensions the backend permits. A stalled stream
+times out in the browser and falls back to snapshots; a large valid frame does
+not trigger polling. The floating panel clamps drag and resize bounds to the
+viewport and its contents remain scrollable on narrow screens.
+
+Control is separate and opt-in: `/control` grants one local owner a ten-minute
+lock, renewed after confirmed actions, and returns a bounded recent-action
+summary. Click and keyboard input require the lock, a confirmation, a current
+window identity and UIA revision, plus a foreground check immediately before
+delivery. Focus is requested through UI Automation; the console does not force
+foreground with `SetForegroundWindow` or `BringWindowToTop`, and rejects the
+action if the target is not foreground. Hotspot clicks are bound to a visible
+element ID and bounds; text and key input are bound to the previewed focused
+element. `/click` supports single, double, right-click and bounded scroll
+actions; `/input` accepts printable text, the restricted navigation key
+allowlist, or UIA-bound double-click, right-click and bounded scroll actions. Window identity tokens accompany captures, UIA reads, and actions
+so a recycled HWND cannot silently retarget an existing mirror or approval.
+Each confirmed action has a bounded idempotency key and is rejected if its UIA
+revision or control bounds changed after preview. The dashboard previews each
+target in a confirmation dialog; Enter is explicitly called out because it can
+submit a form. Win32 bounds, UIA rectangles, capture pixels and pointer
+coordinates share a per-monitor-aware physical-pixel space. Capture retries
+`PrintWindow(PW_RENDERFULLCONTENT)` and permits desktop blit fallback only
+when the target is not overlapped. A panic-stop endpoint disarms the lock and
+ends active mirror streams. The `/control` status includes a short safe audit
+summary; it never includes typed text or window titles. Input auditing is
+bounded. Mutating requests continue to require the console's localhost/Host
+validation and `X-OSLab: 1`.
 
 ## UX readiness
 
@@ -43,6 +161,17 @@ use the shared preview and jobs service for explicit actions. Source readiness
 runs natively through Python, and public Source routes show information without
 polling a local engine. See [[source-lab#Console operations]].
 
+## Web Lab console
+
+[[console/web_api.py]] reports Web Lab readiness, starts and stops the engine
+process, and proxies the engine's `/api/web/*` JSON under the same Host guard.
+`console/oslab.py` registers the lab with the `native-rust` provider.
+
+The local workbench route (`/web-lab/`,
+[[dashboard/src/views/web-lab/pages.tsx]]) opens windows, manages injections,
+runs eval and tails the engine's event log; it is console-only and never
+appears on public Pages.
+
 ## Serving and builds
 
 [[android-lab/lab/web_ui.py]] serves the newest of `dashboard/build` (local)
@@ -56,9 +185,20 @@ the lab. Lab starts require the token returned by the plan preview. See
 
 ## Source navigation
 
-Cleanup Lab navigation links to scan, results, leftovers and history in
-[[dashboard/src/views/cleanup/pages.tsx]]. The public route explains that the
-engine is local, while the local app uses typed cleanup jobs and a confirm step.
+Cleanup Lab navigation splits into the compact Dashboard (Quick clean, Clean
+and monitor stats) and a Settings tab, with the detail tabs keeping their
+routes ([[dashboard/src/views/cleanup/pages.tsx]]).
+
+Settings hosts bookmarks, permissions, the monitor configuration, widgets and
+the tools hub, and is the last item in the Cleanup Lab nav and tab strip.
+
+In the sidebar, Dashboard, Advanced scan, Results and Settings are collapsible
+groups, closed until their page is open. Each lists an Overview entry plus one
+sub-nav per card, such as Storage, Plan & confirm or Desktop widgets. A
+sub-nav link (`/cleanup/<page>/#<section>`) loads the page, scrolls to that
+card once its data is in and outlines it for a few seconds. Spaces, Leftovers,
+History and Relocation have a single card and no group. The public route explains that the engine is local, while the
+local app uses typed cleanup jobs and a confirm step.
 
 [[dashboard/src/views/source/pages.tsx]] provides localized Source Lab routes and
 uses the existing shell for mobile navigation and themes. The sidebar and
