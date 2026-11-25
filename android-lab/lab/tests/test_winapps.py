@@ -172,6 +172,11 @@ def host(monkeypatch):
     monkeypatch.setattr(winapps, "_kernel32", FakeKernel32())
     monkeypatch.setattr(winapps, "_dwmapi", FakeDwm())
     monkeypatch.setattr(winapps, "_advapi32", FakeAdvapi32())
+    monkeypatch.setattr(winapps, "_UIA_ELEMENTS", {})
+    monkeypatch.setattr(winapps, "_CONTROL_STATE", {"armed": False, "armedAt": 0.0, "owner": None})
+    monkeypatch.setattr(winapps, "_ACTION_CACHE", {})
+    monkeypatch.setattr(winapps, "_WINAPPS_STREAM_EPOCH", 0)
+    monkeypatch.setattr(winapps, "_AUDIT_ROWS", [])
     return monkeypatch
 
 
@@ -275,6 +280,19 @@ def test_window_stream_refuses_a_stale_hwnd_before_the_first_frame(host, monkeyp
     monkeypatch.setattr(winapps, "winapps_window_screenshot", stale)
     with pytest.raises(winapps.WinAppError, match="not on screen"):
         next(winapps.winapps_window_stream(1234, 2.0))
+
+
+def test_panic_stop_disarms_and_ends_an_open_stream(host, monkeypatch):
+    png = winapps._png(1, 1, bytes(4))
+    monkeypatch.setattr(winapps, "winapps_window_screenshot", lambda _window_id: png)
+    monkeypatch.setattr(winapps.time, "sleep", lambda _seconds: None)
+    winapps.winapps_control_arm(True, "panel-a")
+    stream = winapps.winapps_window_stream(1234, 2.0)
+    assert next(stream) == png
+    stopped = winapps.winapps_panic_stop()
+    assert stopped["disarmed"] is True
+    assert list(stream) == []
+    assert winapps.winapps_control_state()["armed"] is False
 
 
 def test_window_stream_stops_when_hwnd_is_reused_for_another_window(host, monkeypatch):
@@ -432,3 +450,241 @@ def test_doctor_refuses_to_probe_without_an_interactive_desktop(host):
     result = winapps.doctor()
     assert result["desktop"] is False and result["available"] is False
     assert "interactive desktop" in result["reason"]
+
+
+def test_elements_are_window_relative_and_return_revision_diff(host, monkeypatch):
+    original = {
+        "elementId": "button-a", "role": "Button", "label": "Save",
+        "x": 10, "y": 12, "w": 80, "h": 24, "enabled": True, "focused": False,
+    }
+    current = dict(original)
+    monkeypatch.setattr(winapps, "_uia_read_elements",
+                        lambda _hwnd, _window, **_kwargs: ([dict(current)], False))
+
+    first = winapps.winapps_window_elements("1234")
+    current["x"] = 20
+    second = winapps.winapps_window_elements(1234, first["revision"])
+
+    assert first["bounds"] == {"x": 10, "y": 20, "width": 320, "height": 240}
+    assert first["elements"][0]["x"] == 10
+    assert second["diff"]["changed"][0]["x"] == 20
+    assert second["diff"]["changed"][0]["movedFrom"] == {"x": 10, "y": 12}
+
+
+def test_element_order_and_revision_do_not_depend_on_provider_order(host, monkeypatch):
+    elements = [
+        {"elementId": "b", "role": "Button", "label": "B", "x": 20, "y": 10,
+         "w": 20, "h": 10, "enabled": True, "focused": False},
+        {"elementId": "a", "role": "Button", "label": "A", "x": 10, "y": 10,
+         "w": 20, "h": 10, "enabled": True, "focused": False},
+    ]
+    ordered = [list(elements)]
+    monkeypatch.setattr(winapps, "_uia_read_elements",
+                        lambda _hwnd, _window, **_kwargs: (list(ordered[0]), False))
+    window = winapps._window(1234)
+    token = winapps._window_token(1234, window)
+
+    first = winapps.winapps_window_elements(1234, expected_window_token=token)
+    ordered[0].reverse()
+    second = winapps.winapps_window_elements(
+        1234, revision=first["revision"], expected_window_token=token,
+    )
+
+    assert [element["elementId"] for element in first["elements"]] == ["a", "b"]
+    assert [element["elementId"] for element in second["elements"]] == ["a", "b"]
+    assert second["revision"] == first["revision"]
+    assert second["diff"] == {"added": [], "changed": [], "removed": []}
+
+
+def test_elements_refuse_stale_windows_and_report_unsupported_uia(host, monkeypatch):
+    monkeypatch.setattr(winapps, "_uia_read_elements", lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        winapps.WinAppError("UI Automation is unavailable", status=501)
+    ))
+    with pytest.raises(winapps.WinAppError, match="UI Automation is unavailable") as caught:
+        winapps.winapps_window_elements(1234)
+    assert caught.value.status == 501
+
+    host.setattr(winapps, "_user32", FakeUser32(visible=False))
+    with pytest.raises(winapps.WinAppError, match="not on screen"):
+        winapps.winapps_window_elements(1234)
+
+
+def test_search_matches_roles_and_caps_results(host, monkeypatch):
+    elements = [
+        {"elementId": f"button-{index}", "role": "Button", "label": f"Action {index}",
+         "x": index, "y": 0, "w": 10, "h": 10, "enabled": True, "focused": False}
+        for index in range(70)
+    ]
+    monkeypatch.setattr(winapps, "_uia_read_elements",
+                        lambda _hwnd, _window, **_kwargs: (elements, False))
+    result = winapps.winapps_search_elements(1234, "button")
+    assert result["count"] == winapps.MAX_UIA_SEARCH_RESULTS
+    assert len(result["hits"]) == winapps.MAX_UIA_SEARCH_RESULTS
+    assert all(hit["role"] == "Button" for hit in result["hits"])
+    with pytest.raises(winapps.WinAppError, match="query must contain"):
+        winapps.winapps_search_elements(1234, " " * (winapps.MAX_UIA_QUERY_CHARS + 1))
+
+
+def test_control_lock_is_single_owner_expires_and_can_disarm(host, monkeypatch):
+    armed = winapps.winapps_control_arm(True, "panel-a")
+    assert armed["armed"] is True and armed["owner"] == "panel-a"
+    with pytest.raises(winapps.WinAppError, match="Another dashboard") as caught:
+        winapps.winapps_control_arm(True, "panel-b")
+    assert caught.value.status == 409
+
+    baseline = winapps.time.monotonic()
+    monkeypatch.setattr(winapps.time, "monotonic", lambda: baseline + winapps.CONTROL_TIMEOUT_SECONDS + 1)
+    expired = winapps.winapps_control_state()
+    assert expired["armed"] is False and expired["owner"] is None and expired["expiresInSec"] == 0
+    assert expired["audit"][-1]["kind"] == "arm"
+    assert winapps.winapps_control_arm(False)["armed"] is False
+
+
+def _action_test_context(monkeypatch, *, focused=True):
+    window = {
+        "windowId": 1234, "pid": 42, "app": "Example", "className": "Editor", "title": "first",
+        "x": 10, "y": 20, "width": 320, "height": 240,
+    }
+    element = {
+        "elementId": "button-a", "role": "Button", "label": "Save",
+        "x": 10, "y": 12, "w": 80, "h": 24, "enabled": True, "focused": focused,
+    }
+    elements = [element]
+    hwnd = 1234
+    token = winapps._window_token(hwnd, window)
+    revision = winapps._element_revision(elements)
+    monkeypatch.setattr(winapps, "_visible_window", lambda _window_id: (hwnd, window))
+    monkeypatch.setattr(winapps, "_uia_read_elements_bounded",
+                        lambda _hwnd, _window, **_kwargs: (elements, False))
+    binding = {
+        "windowId": hwnd, "windowToken": token, "revision": revision,
+        "elementId": element["elementId"],
+        "elementBounds": {key: element[key] for key in ("x", "y", "w", "h")},
+        "owner": "panel-a", "confirm": True,
+    }
+    return hwnd, window, element, elements, token, binding
+
+
+def test_click_requires_arm_owner_and_preview_confirmation(host, monkeypatch):
+    hwnd, window, element, _elements, token, binding = _action_test_context(monkeypatch)
+    clicks = []
+    focuses = []
+    monkeypatch.setattr(winapps, "_focus_window",
+                        lambda _hwnd, _token=None: focuses.append((_hwnd, _token)))
+    monkeypatch.setattr(winapps, "_send_mouse_action", lambda *args: clicks.append(args))
+    action = {
+        **binding, "actionId": "click-a",
+        "x": element["x"] + element["w"] // 2, "y": element["y"] + element["h"] // 2,
+    }
+
+    with pytest.raises(winapps.WinAppError, match="not armed"):
+        winapps.winapps_control_click(action)
+    winapps.winapps_control_arm(True, "panel-a")
+    with pytest.raises(winapps.WinAppError, match="Confirm"):
+        winapps.winapps_control_click({**action, "confirm": False})
+    with pytest.raises(winapps.WinAppError, match="Another dashboard"):
+        winapps.winapps_control_click({**action, "owner": "panel-b"})
+    assert clicks == []
+
+    result = winapps.winapps_control_click(action)
+    assert result["actionSent"] is True and result["x"] == 50 and len(clicks) == 1
+    assert clicks[0][:6] == (hwnd, 50, 24, "click", 0, 0)
+    assert clicks[0][6:] == (token, element)
+    assert focuses == [(hwnd, token)]
+    assert winapps.winapps_control_click(action) == result
+    assert len(clicks) == 1
+    with pytest.raises(winapps.WinAppError, match="already used"):
+        winapps.winapps_control_click({**action, "action": "double_click"})
+    assert any(
+        row["kind"] == "click" and row["ok"] is True and row["windowId"] == hwnd
+        for row in winapps.winapps_control_state()["audit"]
+    )
+
+
+def test_click_rejects_stale_preview_before_focusing_or_sending(host, monkeypatch):
+    _hwnd, _window, _element, _elements, _token, binding = _action_test_context(monkeypatch)
+    focuses = []
+    clicks = []
+    monkeypatch.setattr(winapps, "_focus_window",
+                        lambda *_args: focuses.append(True))
+    monkeypatch.setattr(winapps, "_send_mouse_action", lambda *_args: clicks.append(True))
+    winapps.winapps_control_arm(True, "panel-a")
+    action = {
+        **binding, "actionId": "stale-click", "revision": "0" * 16,
+        "x": 50, "y": 24,
+    }
+
+    with pytest.raises(winapps.WinAppError) as caught:
+        winapps.winapps_control_click(action)
+
+    assert caught.value.code == "UIA_STALE"
+    assert focuses == [] and clicks == []
+
+
+def test_input_allowlist_and_audit_never_store_typed_text(host, monkeypatch):
+    hwnd, _window, _element, _elements, token, binding = _action_test_context(monkeypatch)
+    inputs = []
+    monkeypatch.setattr(winapps, "_ensure_foreground_target", lambda _hwnd, _token: {})
+    monkeypatch.setattr(winapps, "_send_keyboard_input", lambda *args: inputs.append(args))
+    winapps.winapps_control_arm(True, "panel-a")
+
+    with pytest.raises(winapps.WinAppError, match="key must be one of"):
+        winapps.winapps_control_input({
+            **binding, "actionId": "bad-key", "kind": "key", "key": "alt-f4",
+        })
+    with pytest.raises(winapps.WinAppError, match="key must be one of"):
+        winapps.winapps_control_input({
+            **binding, "actionId": "space-key", "kind": "key", "key": "space",
+        })
+    with pytest.raises(winapps.WinAppError, match="printable characters"):
+        winapps.winapps_control_input({
+            **binding, "actionId": "too-long", "kind": "type",
+            "text": "x" * (winapps.MAX_INPUT_TEXT_CHARS + 1),
+        })
+
+    secret = "local text"
+    result = winapps.winapps_control_input({
+        **binding, "actionId": "type-a", "kind": "type", "text": secret,
+    })
+    assert result["actionSent"] is True and result["textLength"] == len(secret)
+    assert inputs == [(hwnd, "type", secret, None, token, _elements[0])]
+    assert secret not in repr(winapps._AUDIT_ROWS)
+
+
+def test_keyboard_input_is_not_sent_if_the_target_loses_foreground(host, monkeypatch):
+    sends = []
+    monkeypatch.setattr(winapps._user32, "SendInput",
+                        lambda *args: sends.append(args) or 1, raising=False)
+
+    def lost_focus(_hwnd, _token):
+        raise winapps.WinAppError("The selected window lost focus", status=409, code="FOCUS_LOST")
+
+    monkeypatch.setattr(winapps, "_ensure_foreground_target", lost_focus)
+    with pytest.raises(winapps.WinAppError) as caught:
+        winapps._send_keyboard_input(1234, "type", "sensitive", expected_token="a" * 24)
+
+    assert caught.value.code == "FOCUS_LOST"
+    assert sends == []
+
+
+def test_focus_uses_uia_without_requesting_foreground_from_the_browser(host, monkeypatch):
+    hwnd, window, _element, _elements, token, _binding = _action_test_context(monkeypatch)
+
+    def focus(target):
+        assert target == hwnd
+
+    monkeypatch.setattr(winapps, "_uia_focus_window", focus)
+    monkeypatch.setattr(winapps._user32, "GetForegroundWindow", lambda: hwnd, raising=False)
+    monkeypatch.setattr(winapps._user32, "GetAncestor", lambda target, _flag: target, raising=False)
+    monkeypatch.setattr(
+        winapps._user32, "SetForegroundWindow",
+        lambda *_args: pytest.fail("the console must not request foreground from the browser"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        winapps._user32, "BringWindowToTop",
+        lambda *_args: pytest.fail("the console must not steal foreground from the browser"),
+        raising=False,
+    )
+
+    winapps._focus_window(hwnd, token)

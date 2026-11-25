@@ -7,6 +7,7 @@ const winapps = {
   windows: [
     {
       windowId: 100,
+      windowToken: "a".repeat(24),
       pid: 100,
       app: "Notepad",
       elevated: false,
@@ -67,7 +68,7 @@ function multipartFrame(png: Buffer): Buffer {
 }
 
 const labs: LabStatus[] = [
-  { id: "winapps", label: "Windows Apps Lab", summary: "Read-only mirror of visible desktop applications on this Windows host.", state: "ready", provider: "native-windows", reasons: [], requirements: [], notes: [], actions: [], installed: true },
+  { id: "winapps", label: "Windows Apps Lab", summary: "Local Windows app mirror with guarded UI Automation and input.", state: "ready", provider: "native-windows", reasons: [], requirements: [], notes: [], actions: [], installed: true },
   { id: "windows", label: "Windows Lab", summary: "Windows VM", state: "needs-setup", provider: "wsl2", reasons: [], requirements: [], notes: [], actions: [], installed: true },
   { id: "source", label: "Source Lab", summary: "Local source analysis", state: "ready", provider: "native-python", reasons: [], requirements: [], notes: [], actions: [], installed: true },
   { id: "macos", label: "macOS Lab", summary: "Native Xcode Simulator", state: "unavailable", provider: null, reasons: [], requirements: [], notes: [], actions: [], installed: true },
@@ -77,6 +78,7 @@ const labs: LabStatus[] = [
 ];
 
 async function mockApi(page: Page, os: "windows" | "linux" = "windows") {
+  let controlState = { armed: false, owner: null as string | null, expiresInSec: 0, audit: [] as unknown[] };
   await page.route("**/api/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
     let body: unknown = {};
@@ -93,15 +95,40 @@ async function mockApi(page: Page, os: "windows" | "linux" = "windows") {
     else if (path === "/api/health") body = { status: "ok", version: "test", console: true };
     else if (path === "/api/jobs") body = { jobs: [] };
     else if (path === "/api/labs/winapps/apps") body = winapps;
+    else if (path === "/api/labs/winapps/control") {
+      if (route.request().method() === "POST") {
+        const request = route.request().postDataJSON() as { armed: boolean; owner: string };
+        controlState = request.armed
+          ? { ...controlState, armed: true, owner: request.owner, expiresInSec: 600 }
+          : { ...controlState, armed: false, owner: null, expiresInSec: 0 };
+      }
+      body = controlState;
+    }
+    else if (path === "/api/labs/winapps/apps/100/elements") body = {
+      windowId: 100, windowToken: "a".repeat(24), app: "Notepad", bounds: { x: 10, y: 20, width: 320, height: 240 },
+      revision: "1".repeat(16), engine: "uia", trimmed: false,
+      elements: [{ elementId: "c".repeat(16), role: "Button", label: "Save", x: 40, y: 20, w: 80, h: 24, enabled: true, focused: true }],
+      diff: { added: [], changed: [], removed: [] }
+    };
+    else if (path === "/api/labs/winapps/apps/100/search") body = {
+      windowId: 100, windowToken: "a".repeat(24), app: "Notepad", revision: "1".repeat(16), engine: "uia", query: "save", count: 1,
+      hits: [{ elementId: "c".repeat(16), role: "Button", label: "Save", x: 40, y: 20, w: 80, h: 24, enabled: true, focused: true }]
+    };
+    else if (path === "/api/labs/winapps/click") body = { ok: true, actionSent: true, windowId: 100, x: 80, y: 32 };
+    else if (path === "/api/labs/winapps/input") body = { ok: true, actionSent: true, windowId: 100, kind: "type", textLength: 5 };
+    else if (path === "/api/labs/winapps/stop") {
+      controlState = { ...controlState, armed: false, owner: null, expiresInSec: 0 };
+      body = { ok: true, disarmed: true };
+    }
     else if (path === "/api/labs/winapps/config") body = { lab: "winapps", path: "config.env", exists: true, fields: [], profiles: [], backups: [], endpoints: [] };
     else if (path === "/api/labs/winapps/monitor") body = { lab: "winapps", state: "stopped", containers: [] };
     await route.fulfill({ json: body });
   });
 }
 
-test("the Windows Apps Lab mirrors one real window without offering control", async ({ page }) => {
+test("the Windows Apps Lab mirrors a real window and exposes UI Automation controls", async ({ page }) => {
   await mockApi(page);
-  await page.route("**/api/labs/winapps/apps/100/screenshot", (route) => route.fulfill({
+  await page.route("**/api/labs/winapps/apps/100/screenshot*", (route) => route.fulfill({
     status: 200,
     contentType: "image/png",
     body: PNG_1X1
@@ -128,14 +155,85 @@ test("the Windows Apps Lab mirrors one real window without offering control", as
   expect(box!.height).toBeGreaterThan(100);
   expect(box!.width / box!.height).toBeCloseTo(320 / 240, 1);
   await expect(page.getByText("Elevated")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Arm control" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Arm control" })).toBeVisible();
+});
+
+test("UIA hotspots and keyboard input require preview, arm and explicit confirmation", async ({ page }) => {
+  const actions: { path: string; body: Record<string, unknown> }[] = [];
+  await mockApi(page);
+  await page.route("**/api/labs/winapps/apps/100/screenshot*", (route) => route.fulfill({
+    status: 200, contentType: "image/png", body: PNG_1X1
+  }));
+  await page.route("**/api/labs/winapps/apps/100/stream?fps=*", (route) => route.fulfill({
+    status: 200,
+    contentType: "multipart/x-mixed-replace; boundary=frame",
+    body: Buffer.concat([
+      Buffer.from(`--frame\r\nContent-Type: image/png\r\nContent-Length: ${PNG_1X1.length}\r\n\r\n`),
+      PNG_1X1,
+      Buffer.from("\r\n")
+    ])
+  }));
+  await page.route("**/api/labs/winapps/click", async (route) => {
+    actions.push({ path: "click", body: route.request().postDataJSON() as Record<string, unknown> });
+    await route.fulfill({
+      json: { ok: true, actionSent: true, windowId: 100, x: 80, y: 32, action: "click", actionId: "click-a" }
+    });
+  });
+  await page.route("**/api/labs/winapps/input", async (route) => {
+    actions.push({ path: "input", body: route.request().postDataJSON() as Record<string, unknown> });
+    await route.fulfill({ json: { ok: true, actionSent: true, windowId: 100, kind: "type", textLength: 5 } });
+  });
+
+  await page.goto("/labs/winapps/");
+  await page.getByRole("button", { name: "Elements" }).click();
+  await page.getByRole("textbox", { name: "Search elements" }).fill("save");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await expect(page.getByText("1 matches")).toBeVisible();
+  const hotspot = page.getByRole("button", { name: "Button: Save" });
+  await expect(hotspot).toBeVisible();
+  await hotspot.click();
+  await expect(page.getByRole("dialog")).toContainText("Click UI element");
+  await expect(page.getByRole("button", { name: "Confirm and send" })).toBeDisabled();
+  await expect(page.getByText("Arm control before confirming this action.")).toBeVisible();
+  await page.getByRole("button", { name: "Cancel" }).click();
+
+  await page.getByRole("button", { name: "Arm control" }).click();
+  await expect(page.getByRole("button", { name: "Disarm control" })).toBeVisible();
+  await hotspot.click();
+  await page.getByRole("button", { name: "Confirm and send" }).click();
+  await expect.poll(() => actions.length).toBe(1);
+  expect(actions[0]).toMatchObject({
+    path: "click",
+    body: {
+      confirm: true, owner: expect.any(String), windowId: 100,
+      windowToken: "a".repeat(24), revision: "1".repeat(16),
+      elementId: "c".repeat(16), elementBounds: { x: 40, y: 20, w: 80, h: 24 },
+      x: 80, y: 32, action: "click", actionId: expect.any(String)
+    }
+  });
+
+  await page.getByRole("textbox", { name: "Text to type" }).fill("hello");
+  await page.getByRole("button", { name: "Preview text" }).click();
+  await expect(page.getByRole("dialog")).toContainText("hello");
+  await expect.poll(() => actions.length).toBe(1);
+  await page.getByRole("button", { name: "Confirm and send" }).click();
+  await expect.poll(() => actions.length).toBe(2);
+  expect(actions[1]).toMatchObject({
+    path: "input",
+    body: {
+      confirm: true, owner: expect.any(String), kind: "type", text: "hello",
+      windowId: 100, windowToken: "a".repeat(24), revision: "1".repeat(16),
+      elementId: "c".repeat(16), elementBounds: { x: 40, y: 20, w: 80, h: 24 },
+      actionId: expect.any(String)
+    }
+  });
 });
 
 test("the mirror parses a stream frame and displays it instead of only the snapshot", async ({ page }) => {
   await mockApi(page);
   let snapshots = 0;
   let streams = 0;
-  await page.route("**/api/labs/winapps/apps/100/screenshot", (route) => {
+  await page.route("**/api/labs/winapps/apps/100/screenshot*", (route) => {
     snapshots++;
     return route.fulfill({ status: 200, contentType: "image/png", body: PNG_1X1 });
   });
@@ -170,7 +268,7 @@ test("the stream accepts valid PNG frames larger than 16 MB", async ({ page }) =
       return createObjectURL(object);
     };
   });
-  await page.route("**/api/labs/winapps/apps/100/screenshot", (route) => route.fulfill({
+  await page.route("**/api/labs/winapps/apps/100/screenshot*", (route) => route.fulfill({
     status: 200, contentType: "image/png", body: PNG_1X1
   }));
   await page.route("**/api/labs/winapps/apps/100/stream?fps=*", (route) => route.fulfill({
@@ -190,7 +288,7 @@ test("invalid stream frames are rejected and snapshots continue as fallback", as
   let snapshots = 0;
   let releaseInitialSnapshot!: () => void;
   const initialSnapshotGate = new Promise<void>((resolve) => { releaseInitialSnapshot = resolve; });
-  await page.route("**/api/labs/winapps/apps/100/screenshot", async (route) => {
+  await page.route("**/api/labs/winapps/apps/100/screenshot*", async (route) => {
     snapshots++;
     if (snapshots === 1) await initialSnapshotGate;
     return route.fulfill({ status: 200, contentType: "image/png", body: PNG_1X1 });
@@ -213,7 +311,7 @@ test("a stalled stream switches to screenshot polling", async ({ page }) => {
   test.setTimeout(30_000);
   await mockApi(page);
   let snapshots = 0;
-  await page.route("**/api/labs/winapps/apps/100/screenshot", (route) => {
+  await page.route("**/api/labs/winapps/apps/100/screenshot*", (route) => {
     snapshots++;
     return route.fulfill({ status: 200, contentType: "image/png", body: PNG_1X1 });
   });
@@ -245,14 +343,17 @@ test("a stale stream cannot replace the selected window's newer frame", async ({
       ...winapps,
       windows: [
         winapps.windows[0],
-        { ...winapps.windows[0], windowId: 200, pid: 200, app: "Calculator", title: "Calculator" }
+        {
+          ...winapps.windows[0], windowId: 200, windowToken: "b".repeat(24),
+          pid: 200, app: "Calculator", title: "Calculator"
+        }
       ]
     }
   }));
-  await page.route("**/api/labs/winapps/apps/100/screenshot", (route) => route.fulfill({
+  await page.route("**/api/labs/winapps/apps/100/screenshot*", (route) => route.fulfill({
     status: 200, contentType: "image/png", body: PNG_1X1
   }));
-  await page.route("**/api/labs/winapps/apps/200/screenshot", (route) => route.fulfill({
+  await page.route("**/api/labs/winapps/apps/200/screenshot*", (route) => route.fulfill({
     status: 200, contentType: "image/png", body: PNG_2X1
   }));
   await page.addInitScript(() => {
@@ -302,7 +403,7 @@ test("a stale stream cannot replace the selected window's newer frame", async ({
 test("the floating mirror stays within a narrow viewport while resized and dragged", async ({ page }) => {
   await page.setViewportSize({ width: 375, height: 720 });
   await mockApi(page);
-  await page.route("**/api/labs/winapps/apps/100/screenshot", (route) => route.fulfill({
+  await page.route("**/api/labs/winapps/apps/100/screenshot*", (route) => route.fulfill({
     status: 200, contentType: "image/png", body: PNG_1X1
   }));
   await page.route("**/api/labs/winapps/apps/100/stream?fps=*", (route) => route.fulfill({
@@ -344,7 +445,7 @@ test("the floating mirror stays within a narrow viewport while resized and dragg
 
 test("the mirror can be dragged, resized, docked, hidden and reopened", async ({ page }) => {
   await mockApi(page);
-  await page.route("**/api/labs/winapps/apps/100/screenshot", (route) => route.fulfill({
+  await page.route("**/api/labs/winapps/apps/100/screenshot*", (route) => route.fulfill({
     status: 200,
     contentType: "image/png",
     body: PNG_1X1
@@ -396,7 +497,7 @@ test("an elevated window is marked instead of silently failing", async ({ page }
   await page.route("**/api/labs/winapps/apps", (route) => route.fulfill({
     json: { ...winapps, windows: [{ ...winapps.windows[0], elevated: true }] }
   }));
-  await page.route("**/api/labs/winapps/apps/100/screenshot", (route) => route.fulfill({
+  await page.route("**/api/labs/winapps/apps/100/screenshot*", (route) => route.fulfill({
     status: 400,
     json: { error: "Could not capture that window; try another application window" }
   }));

@@ -1,19 +1,22 @@
-"""Native Windows app mirror: enumerate visible windows and capture one window.
+"""Native Windows app mirror with guarded UI Automation observation and input.
 
 The macOS Lab uses CoreGraphics through ctypes; this is the Windows counterpart.
 It uses a bounded WM_PRINT request with a visibility-checked desktop fallback,
-stays standard-library ctypes only, needs no elevated process, and never exposes
-process command lines or performs input control.
+uses only standard-library ctypes, and needs no elevated process. Input stays
+disabled until a single-owner, expiring arm lock is explicitly enabled.
 """
 
 from __future__ import annotations
 
 import ctypes
+import hashlib
+import json
 import math
 import struct
 import sys
 import threading
 import time
+import unicodedata
 import zlib
 from ctypes import wintypes
 from pathlib import Path
@@ -47,6 +50,26 @@ PRF_CHILDREN = 0x00000010
 SMTO_BLOCK = 0x00000001
 SMTO_ABORTIFHUNG = 0x00000002
 GW_HWNDPREV = 3
+MAX_UIA_ELEMENTS = 150
+MAX_UIA_SEARCH_RESULTS = 50
+MAX_UIA_QUERY_CHARS = 120
+MAX_UIA_WORKERS = 2
+UIA_READ_TIMEOUT_SECONDS = 3.0
+CONTROL_TIMEOUT_SECONDS = 600
+CONTROL_AUDIT_MAX = 200
+MAX_INPUT_TEXT_CHARS = 200
+MAX_ACTION_CACHE = CONTROL_AUDIT_MAX
+INPUT_KEYS = {
+    "tab": 0x09,
+    "escape": 0x1B,
+    "backspace": 0x08,
+    "delete": 0x2E,
+    "up": 0x26,
+    "down": 0x28,
+    "left": 0x25,
+    "right": 0x27,
+    "enter": 0x0D,
+}
 TOOL_CLASSES = {
     "Shell_TrayWnd",
     "Shell_SecondaryTrayWnd",
@@ -58,15 +81,20 @@ TOOL_CLASSES = {
 class WinAppError(Exception):
     """A safe, user-presentable native window inventory/capture failure."""
 
-    def __init__(self, message: str, *, status: int = 400):
+    def __init__(self, message: str, *, status: int = 400, code: str = "WINAPP_ERROR"):
         super().__init__(message)
         self.status = status
+        self.code = code
 
 
 # Keep the Win32 data layout available to the offline tests on other hosts.
 class _RECT(ctypes.Structure):
     _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
                 ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
 
 
 class _BITMAPINFOHEADER(ctypes.Structure):
@@ -83,8 +111,63 @@ class _BITMAPINFO(ctypes.Structure):
     _fields_ = [("bmiHeader", _BITMAPINFOHEADER), ("bmiColors", ctypes.c_ubyte * 4)]
 
 
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("mi", _MOUSEINPUT), ("ki", _KEYBDINPUT), ("hi", _HARDWAREINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _anonymous_ = ("data",)
+    _fields_ = [("type", wintypes.DWORD), ("data", _INPUTUNION)]
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16), ("Data3", ctypes.c_uint16),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class _VARIANTUNION(ctypes.Union):
+    _fields_ = [
+        ("lVal", ctypes.c_int32), ("llVal", ctypes.c_int64), ("boolVal", ctypes.c_int16),
+        ("bstrVal", ctypes.c_void_p), ("parray", ctypes.c_void_p), ("dblVal", ctypes.c_double),
+    ]
+
+
+class _VARIANT(ctypes.Structure):
+    _fields_ = [
+        ("vt", ctypes.c_uint16), ("wReserved1", ctypes.c_uint16),
+        ("wReserved2", ctypes.c_uint16), ("wReserved3", ctypes.c_uint16),
+        ("value", _VARIANTUNION),
+    ]
+
+
 _ENUM_WINDOWS_PROC = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)(
     wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+_COM_CALL = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
+_CLSID_CUIAUTOMATION = _GUID(0xFF48DBA4, 0x60EF, 0x4201,
+                             (ctypes.c_ubyte * 8)(0xAA, 0x87, 0x54, 0x10, 0x3E, 0xEF, 0x59, 0x4E))
+_IID_IUIAUTOMATION = _GUID(0x30CBE57D, 0xD9D0, 0x452A,
+                           (ctypes.c_ubyte * 8)(0xAB, 0x13, 0x7A, 0xC5, 0xAC, 0x48, 0x25, 0xEE))
 
 
 if sys.platform == "win32":
@@ -93,6 +176,12 @@ if sys.platform == "win32":
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
     _advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    _ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+    _oleaut32 = ctypes.WinDLL("oleaut32", use_last_error=True)
+    try:
+        _uia_core = ctypes.WinDLL("UIAutomationCore", use_last_error=True)
+    except OSError:
+        _uia_core = None
 
     _user32.EnumWindows.argtypes = [_ENUM_WINDOWS_PROC, wintypes.LPARAM]
     _user32.EnumWindows.restype = wintypes.BOOL
@@ -172,6 +261,40 @@ if sys.platform == "win32":
     _kernel32.ProcessIdToSessionId.restype = wintypes.BOOL
     _user32.GetShellWindow.argtypes = []
     _user32.GetShellWindow.restype = wintypes.HWND
+    _user32.GetForegroundWindow.argtypes = []
+    _user32.GetForegroundWindow.restype = wintypes.HWND
+    _user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    _user32.SetForegroundWindow.restype = wintypes.BOOL
+    _user32.BringWindowToTop.argtypes = [wintypes.HWND]
+    _user32.BringWindowToTop.restype = wintypes.BOOL
+    _user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+    _user32.GetSystemMetrics.restype = ctypes.c_int
+    _user32.WindowFromPoint.argtypes = [_POINT]
+    _user32.WindowFromPoint.restype = wintypes.HWND
+    _user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(_INPUT), ctypes.c_int]
+    _user32.SendInput.restype = ctypes.c_uint
+
+    _ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    _ole32.CoInitializeEx.restype = ctypes.c_long
+    _ole32.CoUninitialize.argtypes = []
+    _ole32.CoUninitialize.restype = None
+    _ole32.CoCreateInstance.argtypes = [
+        ctypes.POINTER(_GUID), ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p),
+    ]
+    _ole32.CoCreateInstance.restype = ctypes.c_long
+    _oleaut32.VariantClear.argtypes = [ctypes.POINTER(_VARIANT)]
+    _oleaut32.VariantClear.restype = ctypes.c_long
+    _oleaut32.SysStringLen.argtypes = [ctypes.c_void_p]
+    _oleaut32.SysStringLen.restype = ctypes.c_uint
+    _oleaut32.SafeArrayGetDim.argtypes = [ctypes.c_void_p]
+    _oleaut32.SafeArrayGetDim.restype = ctypes.c_uint
+    _oleaut32.SafeArrayGetLBound.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(ctypes.c_long)]
+    _oleaut32.SafeArrayGetLBound.restype = ctypes.c_long
+    _oleaut32.SafeArrayGetUBound.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.POINTER(ctypes.c_long)]
+    _oleaut32.SafeArrayGetUBound.restype = ctypes.c_long
+    _oleaut32.SafeArrayGetElement.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_long), ctypes.c_void_p]
+    _oleaut32.SafeArrayGetElement.restype = ctypes.c_long
 
     _dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
     _dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long  # HRESULT
@@ -184,6 +307,9 @@ if sys.platform == "win32":
     _advapi32.GetTokenInformation.restype = wintypes.BOOL
 else:
     _user32 = _gdi32 = _kernel32 = _dwmapi = _advapi32 = None
+    _ole32 = _oleaut32 = _uia_core = None
+
+_STREAM_SLOTS = threading.BoundedSemaphore(MAX_ACTIVE_STREAMS)
 
 _STREAM_SLOTS = threading.BoundedSemaphore(MAX_ACTIVE_STREAMS)
 
@@ -332,13 +458,15 @@ def _win_windows() -> list[dict[str, Any]]:
 
 
 def winapps_windows() -> dict[str, Any]:
-    """The panel's read-only window inventory."""
+    """The panel's visible top-level window inventory."""
     if sys.platform != "win32":
         return unavailable("Native Windows app mirror needs a Windows host")
     try:
         windows = _win_windows()
     except WinAppError as exc:
         return unavailable(str(exc))
+    for window in windows:
+        window["windowToken"] = _window_token(window["windowId"], window)
     return {"available": True, "reason": None, "windows": windows}
 
 
@@ -487,11 +615,20 @@ def _window_identity(hwnd: int, window: dict[str, Any]) -> tuple[Any, ...]:
     return (thread_id, window["pid"], window["app"], window["className"], window["title"])
 
 
-def winapps_window_screenshot(window_id: int) -> bytes:
+def _window_token(hwnd: int, window: dict[str, Any]) -> str:
+    identity = json.dumps(_window_identity(hwnd, window), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+
+
+def winapps_window_screenshot(window_id: int, expected_token: str | None = None) -> bytes:
     """Capture a window with a bounded app paint request and safe visible-pixel fallback."""
     if sys.platform != "win32" or _user32 is None or _gdi32 is None:
         raise WinAppError("Native Windows app mirror needs a Windows host")
     hwnd, window = _validated_window(window_id)
+    identity = _window_identity(hwnd, window)
+    if expected_token and _window_token(hwnd, window) != expected_token:
+        raise WinAppError("The selected window changed; refresh the mirror",
+                          status=409, code="WINDOW_CHANGED")
     width, height = window["width"], window["height"]
 
     screen_dc = _user32.GetWindowDC(hwnd)
@@ -527,10 +664,19 @@ def winapps_window_screenshot(window_id: int) -> bytes:
         _user32.ReleaseDC(hwnd, screen_dc)
     result = _png(width, height, pixels)
     validate_png_frame(result)
+    current_hwnd, current_window = _validated_window(hwnd)
+    if current_hwnd != hwnd or _window_identity(hwnd, current_window) != identity \
+            or (expected_token and _window_token(hwnd, current_window) != expected_token):
+        raise WinAppError("The selected window changed during capture; refresh the mirror",
+                          status=409, code="WINDOW_CHANGED")
     return result
 
 
-def winapps_window_stream(window_id: int | str, fps: float) -> Iterator[bytes]:
+def winapps_window_stream(
+    window_id: int | str,
+    fps: float,
+    expected_token: str | None = None,
+) -> Iterator[bytes]:
     """Yield bounded PNG frames for one still-visible window.
 
     The first capture happens before the HTTP handler sends stream headers, so a stale
@@ -547,8 +693,14 @@ def winapps_window_stream(window_id: int | str, fps: float) -> Iterator[bytes]:
     try:
         hwnd, initial_window = _validated_window(window_id)
         identity = _window_identity(hwnd, initial_window)
+        if expected_token and _window_token(hwnd, initial_window) != expected_token:
+            raise WinAppError("The selected window changed; refresh the mirror",
+                              status=409, code="WINDOW_CHANGED")
+        epoch = _WINAPPS_STREAM_EPOCH
 
         def capture_bound_frame() -> bytes:
+            if epoch != _WINAPPS_STREAM_EPOCH:
+                raise WinAppError("The Windows app mirror was stopped", status=409, code="STREAM_STOPPED")
             _current_hwnd, before = _validated_window(hwnd)
             if _window_identity(hwnd, before) != identity:
                 raise WinAppError("The selected window changed; refresh the mirror")
@@ -556,25 +708,1106 @@ def winapps_window_stream(window_id: int | str, fps: float) -> Iterator[bytes]:
             _current_hwnd, after = _validated_window(hwnd)
             if _window_identity(hwnd, after) != identity:
                 raise WinAppError("The selected window changed; refresh the mirror")
+            if epoch != _WINAPPS_STREAM_EPOCH:
+                raise WinAppError("The Windows app mirror was stopped", status=409, code="STREAM_STOPPED")
             validate_png_frame(frame)
             return frame
 
         deadline = time.monotonic() + MAX_STREAM_SECONDS
-        yield capture_bound_frame()
+        try:
+            first = capture_bound_frame()
+        except WinAppError as exc:
+            if exc.code == "STREAM_STOPPED":
+                return
+            raise
+        if epoch != _WINAPPS_STREAM_EPOCH:
+            return
+        yield first
         interval = 1.0 / fps
         while True:
+            if epoch != _WINAPPS_STREAM_EPOCH:
+                return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
             time.sleep(min(interval, remaining))
-            if time.monotonic() >= deadline:
+            if epoch != _WINAPPS_STREAM_EPOCH or time.monotonic() >= deadline:
                 return
             try:
-                yield capture_bound_frame()
+                frame = capture_bound_frame()
             except WinAppError:
                 return
+            if epoch != _WINAPPS_STREAM_EPOCH:
+                return
+            yield frame
     finally:
         _STREAM_SLOTS.release()
+
+
+_UIA_ELEMENTS: dict[int, dict[str, Any]] = {}
+_UIA_ELEMENTS_LOCK = threading.Lock()
+_UIA_READ_LOCK = threading.Lock()
+_UIA_PENDING_WINDOWS: set[int] = set()
+_UIA_WORKER_SLOTS = threading.BoundedSemaphore(MAX_UIA_WORKERS)
+_CONTROL_STATE = {"armed": False, "armedAt": 0.0, "owner": None}
+_CONTROL_LOCK = threading.Lock()
+_WINAPPS_STREAM_EPOCH = 0
+_AUDIT_ROWS: list[dict[str, Any]] = []
+_AUDIT_LOCK = threading.Lock()
+_ACTION_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+
+_UIA_PROPERTY_NAME = 30005
+_UIA_PROPERTY_CONTROL_TYPE = 30003
+_UIA_PROPERTY_BOUNDING_RECTANGLE = 30001
+_UIA_PROPERTY_RUNTIME_ID = 30000
+_UIA_PROPERTY_IS_ENABLED = 30010
+_UIA_PROPERTY_HAS_KEYBOARD_FOCUS = 30008
+_UIA_PROPERTY_IS_OFFSCREEN = 30022
+_UIA_PROPERTY_IS_PASSWORD = 30019
+_UIA_CONTROL_TYPES = {
+    50000: "Button", 50001: "Calendar", 50002: "CheckBox", 50003: "ComboBox",
+    50004: "Edit", 50005: "Hyperlink", 50006: "Image", 50007: "ListItem",
+    50008: "List", 50009: "Menu", 50010: "MenuBar", 50011: "MenuItem",
+    50012: "ProgressBar", 50013: "RadioButton", 50014: "ScrollBar",
+    50015: "Slider", 50016: "Spinner", 50017: "StatusBar", 50018: "Tab",
+    50019: "TabItem", 50020: "Text", 50021: "ToolBar", 50022: "ToolTip",
+    50023: "Tree", 50024: "TreeItem", 50025: "Custom", 50026: "Group",
+    50027: "Thumb", 50028: "DataGrid", 50029: "DataItem", 50030: "Document",
+    50031: "SplitButton", 50032: "Window", 50033: "Pane", 50034: "Header",
+    50035: "HeaderItem", 50036: "Table", 50037: "TitleBar", 50038: "Separator",
+    50039: "SemanticZoom", 50040: "AppBar",
+}
+
+_IUIAUTOMATION_ELEMENT_FROM_HANDLE = 6
+# Verified against IUIAutomation in UIAutomationClient.h: RawViewCondition is
+# slot 17 and ControlViewCondition is slot 18, including IUnknown's 3 slots.
+_IUIAUTOMATION_CONTROL_VIEW_CONDITION = 18
+_IUIAUTOMATIONELEMENT_FIND_ALL = 6
+
+
+def _com_method(interface: ctypes.c_void_p, index: int, result_type, arg_types: list, *args):
+    """Call one documented COM vtable method without an external COM package."""
+    table = ctypes.cast(interface, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+    address = table[index]
+    if not address:
+        raise WinAppError("Windows UI Automation returned an invalid interface", status=503)
+    method = _COM_CALL(result_type, ctypes.c_void_p, *arg_types)(address)
+    return method(interface, *args)
+
+
+def _com_release(interface: ctypes.c_void_p | None) -> None:
+    if interface:
+        _com_method(interface, 2, ctypes.c_uint32, [])
+
+
+def _uia_variant_value(element: ctypes.c_void_p, property_id: int):
+    if _oleaut32 is None:
+        raise WinAppError("Windows UI Automation is not available", status=501)
+    value = _VARIANT()
+    result = _com_method(
+        element, 10, ctypes.c_long,
+        [ctypes.c_int, ctypes.POINTER(_VARIANT)], property_id, ctypes.byref(value),
+    )
+    if result < 0:
+        raise WinAppError("UI Automation could not read a window element", status=503)
+    try:
+        if value.vt == 3:
+            return int(value.value.lVal)
+        if value.vt == 11:
+            return value.value.boolVal != 0
+        if value.vt == 8:
+            pointer = value.value.bstrVal
+            length = _oleaut32.SysStringLen(pointer) if pointer else 0
+            return ctypes.wstring_at(pointer, length) if pointer and length else ""
+        if value.vt == 0x2005:
+            array = value.value.parray
+            if not array or _oleaut32.SafeArrayGetDim(array) != 1:
+                return None
+            lower, upper = ctypes.c_long(), ctypes.c_long()
+            if _oleaut32.SafeArrayGetLBound(array, 1, ctypes.byref(lower)) < 0 \
+                    or _oleaut32.SafeArrayGetUBound(array, 1, ctypes.byref(upper)) < 0 \
+                    or upper.value - lower.value != 3:
+                return None
+            coordinates = []
+            for offset in range(4):
+                index, coordinate = ctypes.c_long(lower.value + offset), ctypes.c_double()
+                if _oleaut32.SafeArrayGetElement(array, ctypes.byref(index), ctypes.byref(coordinate)) < 0:
+                    return None
+                coordinates.append(coordinate.value)
+            return coordinates
+        if value.vt == 0x2003:
+            array = value.value.parray
+            if not array or _oleaut32.SafeArrayGetDim(array) != 1:
+                return None
+            lower, upper = ctypes.c_long(), ctypes.c_long()
+            if _oleaut32.SafeArrayGetLBound(array, 1, ctypes.byref(lower)) < 0 \
+                    or _oleaut32.SafeArrayGetUBound(array, 1, ctypes.byref(upper)) < 0 \
+                    or not 1 <= upper.value - lower.value + 1 <= 32:
+                return None
+            values = []
+            for offset in range(upper.value - lower.value + 1):
+                index, item = ctypes.c_long(lower.value + offset), ctypes.c_int32()
+                if _oleaut32.SafeArrayGetElement(array, ctypes.byref(index), ctypes.byref(item)) < 0:
+                    return None
+                values.append(item.value)
+            return values
+        return None
+    finally:
+        _oleaut32.VariantClear(ctypes.byref(value))
+
+
+def _uia_sort_elements(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        (dict(element) for element in elements),
+        key=lambda element: (
+            element["y"], element["x"], element["h"], element["w"],
+            element["role"].casefold(), element["label"].casefold(), element["elementId"],
+        ),
+    )
+
+
+def _uia_window_relative_bounds(rectangle: list[float], window: dict[str, Any]) -> dict[str, int] | None:
+    """Convert UIA physical screen bounds to the same physical client frame used by capture."""
+    if len(rectangle) != 4 or not all(math.isfinite(value) for value in rectangle):
+        return None
+    left, top, right, bottom = rectangle
+    x0 = max(0, math.floor(left - window["x"]))
+    y0 = max(0, math.floor(top - window["y"]))
+    x1 = min(window["width"], math.ceil(right - window["x"]))
+    y1 = min(window["height"], math.ceil(bottom - window["y"]))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0}
+
+
+def _uia_read_elements(
+    hwnd: int,
+    window: dict[str, Any],
+    *,
+    focus_element_id: str | None = None,
+    expected_revision: str | None = None,
+    expected_bounds: dict[str, int] | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Read the visible control view for one HWND; password controls are never exposed."""
+    if _uia_core is None or _ole32 is None or _oleaut32 is None:
+        raise WinAppError("Windows UI Automation is not available on this host", status=501)
+    initialized = _ole32.CoInitializeEx(None, 0)  # COINIT_MULTITHREADED
+    if initialized < 0:
+        raise WinAppError("UI Automation could not initialize COM on this request thread", status=503)
+
+    automation = root = condition = array = None
+    raw_elements: list[tuple[dict[str, Any], tuple[int, ...] | None, ctypes.c_void_p | None]] = []
+    try:
+        automation = ctypes.c_void_p()
+        result = _ole32.CoCreateInstance(
+            ctypes.byref(_CLSID_CUIAUTOMATION), None, 1,  # CLSCTX_INPROC_SERVER
+            ctypes.byref(_IID_IUIAUTOMATION), ctypes.byref(automation),
+        )
+        if result < 0 or not automation.value:
+            raise WinAppError("Windows UI Automation could not be created", status=501)
+
+        root = ctypes.c_void_p()
+        result = _com_method(
+            automation, _IUIAUTOMATION_ELEMENT_FROM_HANDLE, ctypes.c_long,
+            [wintypes.HWND, ctypes.POINTER(ctypes.c_void_p)], hwnd, ctypes.byref(root),
+        )  # IUIAutomation::ElementFromHandle
+        if result < 0 or not root.value:
+            raise WinAppError("UI Automation could not attach to that window; refresh the mirror")
+
+        condition = ctypes.c_void_p()
+        result = _com_method(
+            automation, _IUIAUTOMATION_CONTROL_VIEW_CONDITION, ctypes.c_long,
+            [ctypes.POINTER(ctypes.c_void_p)],
+            ctypes.byref(condition),
+        )  # IUIAutomation::get_ControlViewCondition
+        if result < 0 or not condition.value:
+            raise WinAppError("Windows UI Automation could not create a control-view filter", status=503)
+
+        array = ctypes.c_void_p()
+        result = _com_method(
+            root, _IUIAUTOMATIONELEMENT_FIND_ALL, ctypes.c_long,
+            [ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)],
+            4, condition, ctypes.byref(array),
+        )  # IUIAutomationElement::FindAll(TreeScope_Descendants, condition)
+        if result < 0 or not array.value:
+            raise WinAppError("UI Automation could not enumerate this window's controls", status=503)
+
+        count = ctypes.c_int()
+        result = _com_method(array, 3, ctypes.c_long, [ctypes.POINTER(ctypes.c_int)], ctypes.byref(count))
+        if result < 0 or count.value < 0:
+            raise WinAppError("UI Automation returned an invalid element list", status=503)
+        scan_count = min(count.value, MAX_UIA_ELEMENTS * 8)
+        trimmed = count.value > scan_count
+        for index in range(scan_count):
+            item = ctypes.c_void_p()
+            result = _com_method(
+                array, 4, ctypes.c_long,
+                [ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)], index, ctypes.byref(item),
+            )
+            if result < 0 or not item.value:
+                _com_release(item)
+                continue
+            try:
+                if _uia_variant_value(item, _UIA_PROPERTY_IS_OFFSCREEN) is not False:
+                    continue
+                if _uia_variant_value(item, _UIA_PROPERTY_IS_PASSWORD) is True:
+                    continue
+                rectangle = _uia_variant_value(item, _UIA_PROPERTY_BOUNDING_RECTANGLE)
+                relative_bounds = _uia_window_relative_bounds(rectangle, window) \
+                    if isinstance(rectangle, list) else None
+                if relative_bounds is None:
+                    continue
+                control_type = _uia_variant_value(item, _UIA_PROPERTY_CONTROL_TYPE)
+                if not isinstance(control_type, int):
+                    continue
+                role = _UIA_CONTROL_TYPES.get(control_type, "Custom")
+                label_value = _uia_variant_value(item, _UIA_PROPERTY_NAME)
+                label = (label_value if isinstance(label_value, str) else "")[:120]
+                element = {
+                    "role": role,
+                    "label": label,
+                    **relative_bounds,
+                    "enabled": _uia_variant_value(item, _UIA_PROPERTY_IS_ENABLED) is True,
+                    "focused": _uia_variant_value(item, _UIA_PROPERTY_HAS_KEYBOARD_FOCUS) is True,
+                }
+                runtime_value = _uia_variant_value(item, _UIA_PROPERTY_RUNTIME_ID)
+                runtime_id = tuple(runtime_value) if isinstance(runtime_value, list) \
+                    and runtime_value and all(type(value) is int for value in runtime_value) else None
+                raw_elements.append((element, runtime_id, item if focus_element_id else None))
+                if focus_element_id:
+                    item = None
+            finally:
+                _com_release(item)
+        raw_elements.sort(key=lambda pair: (
+            pair[0]["y"], pair[0]["x"], pair[0]["h"], pair[0]["w"],
+            pair[0]["role"].casefold(), pair[0]["label"].casefold(), pair[1] or (),
+        ))
+        fallback_occurrences: dict[tuple[Any, ...], int] = {}
+        all_elements: list[dict[str, Any]] = []
+        interfaces_by_id: dict[str, ctypes.c_void_p | None] = {}
+        for element, runtime_id, interface in raw_elements:
+            if runtime_id is not None:
+                identity = json.dumps(runtime_id, separators=(",", ":"))
+            else:
+                key = (
+                    element["role"], element["label"], element["x"], element["y"],
+                    element["w"], element["h"],
+                )
+                occurrence = fallback_occurrences.get(key, 0)
+                fallback_occurrences[key] = occurrence + 1
+                identity = json.dumps((*key, occurrence), ensure_ascii=False, separators=(",", ":"))
+            element["elementId"] = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+            all_elements.append(element)
+            interfaces_by_id[element["elementId"]] = interface
+        ordered_elements = _uia_sort_elements(all_elements)
+        trimmed = trimmed or len(ordered_elements) > MAX_UIA_ELEMENTS
+        elements = ordered_elements[:MAX_UIA_ELEMENTS]
+        if focus_element_id:
+            target_element = next(
+                (element for element in elements if element["elementId"] == focus_element_id), None
+            )
+            target_interface = interfaces_by_id.get(focus_element_id)
+            if target_element is None or target_interface is None:
+                raise WinAppError("The previewed UI Automation control is no longer available",
+                                  status=409, code="UIA_TARGET_CHANGED")
+            if not target_element["enabled"]:
+                raise WinAppError("The previewed UI Automation control is disabled",
+                                  status=409, code="UIA_TARGET_CHANGED")
+            actual_revision = _element_revision(elements)
+            if expected_revision and actual_revision != expected_revision:
+                raise WinAppError("The UI changed after the action preview; review it again",
+                                  status=409, code="UIA_STALE")
+            if expected_bounds is not None and any(
+                target_element[key] != expected_bounds[value]
+                for key, value in (("x", "x"), ("y", "y"), ("w", "w"), ("h", "h"))
+            ):
+                raise WinAppError("The previewed UI Automation control moved; review it again",
+                                  status=409, code="UIA_TARGET_CHANGED")
+            result = _com_method(target_interface, 3, ctypes.c_long, [])  # IUIAutomationElement::SetFocus
+            if result < 0:
+                raise WinAppError("Windows could not focus the previewed UI Automation control",
+                                  status=409, code="FOCUS_FAILED")
+        return elements, trimmed
+    finally:
+        for _element, _runtime_id, interface in raw_elements:
+            _com_release(interface)
+        _com_release(array)
+        _com_release(condition)
+        _com_release(root)
+        _com_release(automation)
+        _ole32.CoUninitialize()
+
+
+def _run_uia_bounded(hwnd: int, operation) -> Any:
+    """Run provider calls on a bounded worker and refuse overlapping reads per HWND."""
+    with _UIA_READ_LOCK:
+        if hwnd in _UIA_PENDING_WINDOWS:
+            raise WinAppError("UI Automation is still reading this window; retry shortly",
+                              status=429, code="UIA_BUSY")
+        if not _UIA_WORKER_SLOTS.acquire(blocking=False):
+            raise WinAppError("Windows UI Automation is busy; retry shortly", status=429, code="UIA_BUSY")
+        _UIA_PENDING_WINDOWS.add(hwnd)
+
+    completed = threading.Event()
+    result: dict[str, Any] = {}
+
+    def read() -> None:
+        try:
+            try:
+                result["value"] = operation()
+            except Exception as exc:
+                result["error"] = exc
+        finally:
+            with _UIA_READ_LOCK:
+                _UIA_PENDING_WINDOWS.discard(hwnd)
+                _UIA_WORKER_SLOTS.release()
+            completed.set()
+
+    worker = threading.Thread(target=read, name=f"winapps-uia-{hwnd}", daemon=True)
+    try:
+        worker.start()
+    except RuntimeError:
+        with _UIA_READ_LOCK:
+            _UIA_PENDING_WINDOWS.discard(hwnd)
+            _UIA_WORKER_SLOTS.release()
+        raise
+    if not completed.wait(UIA_READ_TIMEOUT_SECONDS):
+        raise WinAppError("Windows UI Automation did not respond before the timeout",
+                          status=504, code="UIA_TIMEOUT")
+    if "error" in result:
+        raise result["error"]
+    return result["value"]
+
+
+def _uia_read_elements_bounded(
+    hwnd: int,
+    window: dict[str, Any],
+    *,
+    focus_element_id: str | None = None,
+    expected_revision: str | None = None,
+    expected_bounds: dict[str, int] | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    return _run_uia_bounded(hwnd, lambda: _uia_read_elements(
+        hwnd, window, focus_element_id=focus_element_id,
+        expected_revision=expected_revision, expected_bounds=expected_bounds,
+    ))
+
+
+def _validate_hwnd(window_id: int | str) -> int:
+    if isinstance(window_id, bool):
+        raise WinAppError("Invalid window id")
+    if isinstance(window_id, int):
+        hwnd = window_id
+    elif isinstance(window_id, str) and window_id.isascii() and window_id.isdigit():
+        hwnd = int(window_id)
+    else:
+        raise WinAppError("Invalid window id")
+    if not 0 < hwnd <= 0xFFFFFFFF:
+        raise WinAppError("Invalid window id")
+    return hwnd
+
+
+def _visible_window(window_id: int | str) -> tuple[int, dict[str, Any]]:
+    if sys.platform != "win32" or _user32 is None:
+        raise WinAppError("Native Windows app control needs a Windows host", status=501)
+    hwnd = _validate_hwnd(window_id)
+    if _user32.GetAncestor(hwnd, GA_ROOT) != hwnd:
+        raise WinAppError("That window is not on screen anymore; refresh the mirror")
+    window = _window(hwnd)
+    if window is None:
+        raise WinAppError("That window is not on screen anymore; refresh the mirror")
+    return hwnd, window
+
+
+def _element_revision(elements: list[dict[str, Any]]) -> str:
+    content = json.dumps(elements, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(content).hexdigest()[:16]
+
+
+def _diff_ui_elements(previous: list[dict[str, Any]], current: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    unused = {element["elementId"]: element for element in previous}
+    added, changed = [], []
+    for element in current:
+        old = unused.pop(element["elementId"], None)
+        if old is None:
+            added.append(element)
+        elif any(old[key] != element[key] for key in (
+            "role", "label", "x", "y", "w", "h", "enabled", "focused"
+        )):
+            changed.append({**element, "movedFrom": {"x": old["x"], "y": old["y"]}})
+    return {"added": added[:MAX_UIA_ELEMENTS], "changed": changed[:MAX_UIA_ELEMENTS],
+            "removed": list(unused.values())[:MAX_UIA_ELEMENTS]}
+
+
+def winapps_window_elements(
+    window_id: int | str,
+    revision: str | None = None,
+    expected_window_token: str | None = None,
+) -> dict[str, Any]:
+    """Visible UI Automation controls in one validated window and a bounded revision diff."""
+    hwnd, window = _visible_window(window_id)
+    window_token = _window_token(hwnd, window)
+    if expected_window_token and expected_window_token != window_token:
+        raise WinAppError("The selected window changed; refresh the mirror",
+                          status=409, code="WINDOW_CHANGED")
+    if revision is not None and (not isinstance(revision, str) or len(revision) > 64):
+        raise WinAppError("revision must be a short UI Automation revision token")
+    identity = _window_identity(hwnd, window)
+    elements, trimmed = _uia_read_elements_bounded(hwnd, window)
+    current_hwnd, current_window = _visible_window(hwnd)
+    if current_hwnd != hwnd or _window_identity(hwnd, current_window) != identity \
+            or (expected_window_token and _window_token(hwnd, current_window) != expected_window_token):
+        raise WinAppError("The selected window changed during UI Automation; refresh the mirror",
+                          status=409, code="WINDOW_CHANGED")
+    elements = _uia_sort_elements(elements)
+    token = _element_revision(elements)
+    window_token = _window_token(hwnd, current_window)
+    if expected_window_token and window_token != expected_window_token:
+        raise WinAppError("The selected window changed; refresh the mirror",
+                          status=409, code="WINDOW_CHANGED")
+    with _UIA_ELEMENTS_LOCK:
+        cached = _UIA_ELEMENTS.get(hwnd)
+        diff = _diff_ui_elements(cached["elements"], elements) if (
+            revision and cached and cached["windowIdentity"] == identity
+            and cached["revision"] == revision and revision != token
+        ) else {"added": [], "changed": [], "removed": []}
+        _UIA_ELEMENTS[hwnd] = {
+            "revision": token, "elements": elements, "windowIdentity": identity, "at": time.monotonic(),
+        }
+        if len(_UIA_ELEMENTS) > 16:
+            oldest = min(_UIA_ELEMENTS, key=lambda key: _UIA_ELEMENTS[key]["at"])
+            _UIA_ELEMENTS.pop(oldest, None)
+    return {
+        "windowId": hwnd,
+        "windowToken": window_token,
+        "app": window["app"],
+        "bounds": {"x": window["x"], "y": window["y"], "width": window["width"], "height": window["height"]},
+        "revision": token,
+        "engine": "uia",
+        "trimmed": trimmed,
+        "elements": elements,
+        "diff": diff,
+    }
+
+
+def winapps_search_elements(
+    window_id: int | str,
+    query: str,
+    expected_window_token: str | None = None,
+) -> dict[str, Any]:
+    """Search UIA labels and roles without returning more than fifty matching controls."""
+    if not isinstance(query, str) or not query.strip() or len(query) > MAX_UIA_QUERY_CHARS:
+        raise WinAppError(f"query must contain 1-{MAX_UIA_QUERY_CHARS} characters")
+    hwnd, window = _visible_window(window_id)
+    if expected_window_token and _window_token(hwnd, window) != expected_window_token:
+        raise WinAppError("The selected window changed; refresh the mirror",
+                          status=409, code="WINDOW_CHANGED")
+    identity = _window_identity(hwnd, window)
+    elements, _trimmed = _uia_read_elements_bounded(hwnd, window)
+    current_hwnd, current_window = _visible_window(hwnd)
+    if current_hwnd != hwnd or _window_identity(hwnd, current_window) != identity \
+            or (expected_window_token and _window_token(hwnd, current_window) != expected_window_token):
+        raise WinAppError("The selected window changed during UI Automation; refresh the mirror",
+                          status=409, code="WINDOW_CHANGED")
+    elements = _uia_sort_elements(elements)
+    needle = query.strip().casefold()
+    hits = [
+        element for element in elements
+        if needle in element["label"].casefold() or needle in element["role"].casefold()
+    ][:MAX_UIA_SEARCH_RESULTS]
+    return {
+        "windowId": hwnd,
+        "windowToken": _window_token(hwnd, current_window),
+        "app": window["app"],
+        "revision": _element_revision(elements),
+        "engine": "uia",
+        "query": query.strip(),
+        "count": len(hits),
+        "hits": hits,
+    }
+
+
+def _record_audit(kind: str, *, window: dict[str, Any] | None = None,
+                  detail: dict[str, Any] | None = None) -> None:
+    """Keep a bounded local-only audit ring; never retain user-entered text or window titles."""
+    row: dict[str, Any] = {"time": time.time(), "kind": kind}
+    if window:
+        row.update({"windowId": window.get("windowId"), "app": window.get("app")})
+    if detail:
+        row.update(detail)
+    with _AUDIT_LOCK:
+        _AUDIT_ROWS.append(row)
+        del _AUDIT_ROWS[:-CONTROL_AUDIT_MAX]
+
+
+def _control_active_locked(now: float) -> bool:
+    if _CONTROL_STATE["armed"] and now - _CONTROL_STATE["armedAt"] < CONTROL_TIMEOUT_SECONDS:
+        return True
+    _CONTROL_STATE.update({"armed": False, "armedAt": 0.0, "owner": None})
+    return False
+
+
+def winapps_control_state() -> dict[str, Any]:
+    with _CONTROL_LOCK:
+        now = time.monotonic()
+        armed = _control_active_locked(now)
+        expires = max(0, int(CONTROL_TIMEOUT_SECONDS - (now - _CONTROL_STATE["armedAt"]))) if armed else 0
+        owner = _CONTROL_STATE["owner"] if armed else None
+    with _AUDIT_LOCK:
+        audit = [
+            {key: row[key] for key in ("time", "kind", "windowId", "app", "ok", "reason") if key in row}
+            for row in _AUDIT_ROWS[-10:]
+        ]
+    return {"armed": armed, "owner": owner, "expiresInSec": expires, "audit": audit}
+
+
+def _validated_owner(owner: Any) -> str:
+    if not isinstance(owner, str) or not 1 <= len(owner) <= 64 \
+            or not all(char.isascii() and (char.isalnum() or char in "-_.:") for char in owner):
+        raise WinAppError("owner must be a 1-64 character local control id")
+    return owner
+
+
+def winapps_control_arm(armed: bool, owner: str | None = None) -> dict[str, Any]:
+    if not isinstance(armed, bool):
+        raise WinAppError("armed must be true or false")
+    if armed and (sys.platform != "win32" or _user32 is None):
+        raise WinAppError("Native Windows app control needs a Windows host", status=501)
+    owner_id = _validated_owner(owner) if owner is not None else None
+    if armed and owner_id is None:
+        raise WinAppError("owner is required to arm Windows app control")
+    with _CONTROL_LOCK:
+        now = time.monotonic()
+        active = _control_active_locked(now)
+        if armed and active and _CONTROL_STATE["owner"] != owner_id:
+            raise WinAppError("Another dashboard holds the Windows app control lock", status=409, code="ARMED_BY_OTHER")
+        if not armed and active and _CONTROL_STATE["owner"] != owner_id:
+            raise WinAppError("Only the control-lock owner can disarm Windows app input",
+                              status=409, code="ARMED_BY_OTHER")
+        _CONTROL_STATE.update({"armed": armed, "armedAt": now if armed else 0.0, "owner": owner_id})
+    _record_audit("arm" if armed else "disarm")
+    return winapps_control_state()
+
+
+def winapps_panic_stop() -> dict[str, Any]:
+    """Idempotently disarm input and end all currently open mirror streams."""
+    global _WINAPPS_STREAM_EPOCH
+    with _CONTROL_LOCK:
+        _CONTROL_STATE.update({"armed": False, "armedAt": 0.0, "owner": None})
+        _WINAPPS_STREAM_EPOCH += 1
+    _record_audit("panic-stop", detail={"streamEpoch": _WINAPPS_STREAM_EPOCH})
+    return {"ok": True, "disarmed": True, "streamEpoch": _WINAPPS_STREAM_EPOCH}
+
+
+def _require_control_locked(owner: Any, confirm: Any) -> str:
+    owner_id = _validated_owner(owner)
+    if confirm is not True:
+        raise WinAppError("Confirm the previewed action before sending input", code="CONFIRM_REQUIRED")
+    now = time.monotonic()
+    if not _control_active_locked(now):
+        raise WinAppError("Control mode is not armed; arm the app mirror first", code="NOT_ARMED")
+    if owner_id != _CONTROL_STATE["owner"]:
+        raise WinAppError("Another dashboard holds the Windows app control lock", status=409, code="INPUT_BUSY")
+    return owner_id
+
+
+def _uia_focus_window(hwnd: int) -> None:
+    if _uia_core is None or _ole32 is None:
+        raise WinAppError("Windows UI Automation is not available on this host", status=501)
+    initialized = _ole32.CoInitializeEx(None, 0)
+    if initialized < 0:
+        raise WinAppError("UI Automation could not initialize COM for focus", status=503)
+    automation = root = None
+    try:
+        automation = ctypes.c_void_p()
+        result = _ole32.CoCreateInstance(
+            ctypes.byref(_CLSID_CUIAUTOMATION), None, 1,
+            ctypes.byref(_IID_IUIAUTOMATION), ctypes.byref(automation),
+        )
+        if result < 0 or not automation.value:
+            raise WinAppError("Windows UI Automation could not be created", status=501)
+        root = ctypes.c_void_p()
+        result = _com_method(
+            automation, _IUIAUTOMATION_ELEMENT_FROM_HANDLE, ctypes.c_long,
+            [wintypes.HWND, ctypes.POINTER(ctypes.c_void_p)], hwnd, ctypes.byref(root),
+        )
+        if result < 0 or not root.value:
+            raise WinAppError("UI Automation could not attach to that window; refresh the mirror")
+        result = _com_method(root, 3, ctypes.c_long, [])  # IUIAutomationElement::SetFocus
+        if result < 0:
+            raise WinAppError("Windows UI Automation could not focus the selected window",
+                              status=409, code="FOCUS_FAILED")
+    finally:
+        _com_release(root)
+        _com_release(automation)
+        _ole32.CoUninitialize()
+
+
+def _focus_window(hwnd: int, expected_token: str | None = None) -> None:
+    _current, window = _visible_window(hwnd)
+    if expected_token and _window_token(hwnd, window) != expected_token:
+        raise WinAppError("The selected window changed; review the action again",
+                          status=409, code="WINDOW_CHANGED")
+    _run_uia_bounded(hwnd, lambda: _uia_focus_window(hwnd))
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline:
+        foreground = _user32.GetForegroundWindow()
+        if foreground and _user32.GetAncestor(foreground, GA_ROOT) == hwnd:
+            return
+        time.sleep(0.01)
+    raise WinAppError("Windows could not focus the selected window; no input was sent",
+                      status=409, code="FOCUS_FAILED")
+
+
+def _ensure_foreground_target(hwnd: int, expected_token: str) -> dict[str, Any]:
+    _current, window = _visible_window(hwnd)
+    if _window_token(hwnd, window) != expected_token:
+        raise WinAppError("The selected window changed; review the action again",
+                          status=409, code="WINDOW_CHANGED")
+    foreground = _user32.GetForegroundWindow()
+    if not foreground or _user32.GetAncestor(foreground, GA_ROOT) != hwnd:
+        raise WinAppError("The selected window lost focus; no input was sent",
+                          status=409, code="FOCUS_LOST")
+    return window
+
+
+def _send_mouse_action(
+    hwnd: int,
+    x: int,
+    y: int,
+    action: str,
+    delta_x: int,
+    delta_y: int,
+    expected_token: str,
+    expected_element: dict[str, Any] | None = None,
+) -> None:
+    window = _ensure_foreground_target(hwnd, expected_token)
+    if expected_element is not None:
+        elements, _trimmed = _uia_read_elements_bounded(hwnd, window)
+        current = next(
+            (element for element in elements if element["elementId"] == expected_element["elementId"]), None
+        )
+        if current is None or any(current[key] != expected_element[key] for key in (
+            "role", "label", "x", "y", "w", "h", "enabled"
+        )) or not current["enabled"]:
+            raise WinAppError("The previewed UI Automation control changed; review the action again",
+                              status=409, code="UIA_TARGET_CHANGED")
+    rect_x, rect_y = window["x"] + x, window["y"] + y
+    if not (window["x"] <= rect_x < window["x"] + window["width"]
+            and window["y"] <= rect_y < window["y"] + window["height"]):
+        raise WinAppError("Click coordinates fall outside the selected window")
+    screen_left, screen_top = _user32.GetSystemMetrics(76), _user32.GetSystemMetrics(77)
+    screen_width, screen_height = _user32.GetSystemMetrics(78), _user32.GetSystemMetrics(79)
+    if screen_width <= 1 or screen_height <= 1:
+        raise WinAppError("Windows did not report valid desktop bounds", status=503)
+    point = _POINT(rect_x, rect_y)
+    target = _user32.WindowFromPoint(point)
+    if not target or _user32.GetAncestor(target, GA_ROOT) != hwnd:
+        raise WinAppError("The target point is covered by another window; refresh and retry", status=409)
+    absolute_x = round((rect_x - screen_left) * 65535 / (screen_width - 1))
+    absolute_y = round((rect_y - screen_top) * 65535 / (screen_height - 1))
+    events: list[_INPUT] = []
+    events.append(_INPUT(type=0, mi=_MOUSEINPUT(
+        absolute_x, absolute_y, 0, 0x0001 | 0x8000 | 0x4000, 0, 0
+    )))
+    if action in ("click", "double_click", "right_click"):
+        down, up = (0x0008, 0x0010) if action == "right_click" else (0x0002, 0x0004)
+        count = 2 if action == "double_click" else 1
+        for _index in range(count):
+            events.append(_INPUT(type=0, mi=_MOUSEINPUT(absolute_x, absolute_y, 0, down, 0, 0)))
+            events.append(_INPUT(type=0, mi=_MOUSEINPUT(absolute_x, absolute_y, 0, up, 0, 0)))
+    elif action == "scroll":
+        if delta_y:
+            events.append(_INPUT(type=0, mi=_MOUSEINPUT(
+                absolute_x, absolute_y, ctypes.c_uint32(delta_y).value, 0x0800, 0, 0
+            )))
+        if delta_x:
+            events.append(_INPUT(type=0, mi=_MOUSEINPUT(
+                absolute_x, absolute_y, ctypes.c_uint32(delta_x).value, 0x1000, 0, 0
+            )))
+    else:
+        raise WinAppError("action must be click, double_click, right_click or scroll")
+    batch = (_INPUT * len(events))(*events)
+    _ensure_foreground_target(hwnd, expected_token)
+    target = _user32.WindowFromPoint(point)
+    if not target or _user32.GetAncestor(target, GA_ROOT) != hwnd:
+        raise WinAppError("The target point is covered by another window; refresh and retry", status=409)
+    sent = _user32.SendInput(len(events), batch, ctypes.sizeof(_INPUT))
+    if sent != len(events):
+        release: list[_INPUT] = []
+        release_flags = {0x0002: 0x0004, 0x0008: 0x0010}
+        for index in range(min(sent, len(events))):
+            flags = events[index].mi.dwFlags
+            if flags in release_flags:
+                release.append(_INPUT(type=0, mi=_MOUSEINPUT(
+                    absolute_x, absolute_y, 0, release_flags[flags], 0, 0
+                )))
+        if release:
+            release_batch = (_INPUT * len(release))(*release)
+            _user32.SendInput(len(release), release_batch, ctypes.sizeof(_INPUT))
+        raise WinAppError("Windows accepted only part of the mouse input; held buttons were released",
+                          status=503, code="INPUT_PARTIAL")
+
+
+def _send_mouse_click(hwnd: int, x: int, y: int, window: dict[str, Any],
+                      expected_token: str | None = None) -> None:
+    token = expected_token or _window_token(hwnd, window)
+    _send_mouse_action(hwnd, x, y, "click", 0, 0, token)
+
+
+def _send_keyboard_input(
+    hwnd: int,
+    kind: str,
+    text: str | None = None,
+    key: str | None = None,
+    expected_token: str | None = None,
+    expected_element: dict[str, Any] | None = None,
+) -> None:
+    if kind == "key":
+        vk = INPUT_KEYS[key]
+        events = (_INPUT * 2)()
+        events[0].type = 1
+        events[0].ki = _KEYBDINPUT(vk, 0, 0, 0, 0)
+        events[1].type = 1
+        events[1].ki = _KEYBDINPUT(vk, 0, 0x0002, 0, 0)  # KEYEVENTF_KEYUP
+    else:
+        code_units = text.encode("utf-16-le")
+        events = (_INPUT * (len(code_units) // 2 * 2))()
+        for index in range(0, len(code_units), 2):
+            code_unit = int.from_bytes(code_units[index:index + 2], "little")
+            event_index = index
+            events[event_index].type = 1
+            events[event_index].ki = _KEYBDINPUT(0, code_unit, 0x0004, 0, 0)  # KEYEVENTF_UNICODE
+            events[event_index + 1].type = 1
+            events[event_index + 1].ki = _KEYBDINPUT(0, code_unit, 0x0004 | 0x0002, 0, 0)
+    token = expected_token
+    if token is None:
+        _current, window = _visible_window(hwnd)
+        token = _window_token(hwnd, window)
+    if expected_element is not None:
+        _current, window = _visible_window(hwnd)
+        elements, _trimmed = _uia_read_elements_bounded(hwnd, window)
+        current = next(
+            (element for element in elements if element["elementId"] == expected_element["elementId"]), None
+        )
+        if current is None or any(current[key] != expected_element[key] for key in (
+            "role", "label", "x", "y", "w", "h", "enabled"
+        )) or not current["enabled"] or not current["focused"]:
+            raise WinAppError("The previewed UI Automation control no longer has focus",
+                              status=409, code="FOCUS_LOST")
+    _ensure_foreground_target(hwnd, token)
+    sent = _user32.SendInput(len(events), events, ctypes.sizeof(_INPUT))
+    if sent != len(events):
+        if sent % 2:
+            held = events[sent - 1]
+            release = (_INPUT * 1)()
+            release[0] = held
+            release[0].ki.dwFlags |= 0x0002
+            _user32.SendInput(1, release, ctypes.sizeof(_INPUT))
+        raise WinAppError("Windows accepted only part of the keyboard input; held keys were released",
+                          status=503, code="INPUT_PARTIAL")
+
+
+def _validated_action_binding(data: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise WinAppError("Action data must be a JSON object")
+    if data.get("confirm") is not True:
+        raise WinAppError("Confirm the previewed action before sending input", code="CONFIRM_REQUIRED")
+    values: dict[str, Any] = {"owner": _validated_owner(data.get("owner"))}
+    action_id = data.get("actionId")
+    if not isinstance(action_id, str) or not 1 <= len(action_id) <= 64 \
+            or not all(char.isascii() and (char.isalnum() or char in "-_.:") for char in action_id):
+        raise WinAppError("actionId must be a 1-64 character idempotency key")
+    values["actionId"] = action_id
+    window_id = data.get("windowId")
+    if type(window_id) is not int or not 0 < window_id <= 0xFFFFFFFF:
+        raise WinAppError("windowId must be a valid integer window handle")
+    values["windowId"] = window_id
+    window_token = data.get("windowToken")
+    if not isinstance(window_token, str) or len(window_token) != 24 \
+            or any(char not in "0123456789abcdef" for char in window_token):
+        raise WinAppError("windowToken must be a current window identity token")
+    values["windowToken"] = window_token
+    revision = data.get("revision")
+    if not isinstance(revision, str) or len(revision) != 16 \
+            or any(char not in "0123456789abcdef" for char in revision):
+        raise WinAppError("revision must be a current UI Automation revision")
+    values["revision"] = revision
+    element_id = data.get("elementId")
+    if not isinstance(element_id, str) or not 1 <= len(element_id) <= 64 \
+            or not all(char.isascii() and (char.isalnum() or char in "-_.:") for char in element_id):
+        raise WinAppError("elementId must identify a visible UI Automation control")
+    values["elementId"] = element_id
+    bounds = data.get("elementBounds")
+    if not isinstance(bounds, dict) or set(bounds) != {"x", "y", "w", "h"} \
+            or any(type(bounds[key]) is not int for key in ("x", "y", "w", "h")) \
+            or bounds["x"] < 0 or bounds["y"] < 0 or bounds["w"] <= 0 or bounds["h"] <= 0:
+        raise WinAppError("elementBounds must contain positive window-relative UI Automation bounds")
+    values["elementBounds"] = dict(bounds)
+    return values
+
+
+def _validated_click(data: dict[str, Any]) -> dict[str, Any]:
+    values = _validated_action_binding(data)
+    for key in ("x", "y"):
+        value = data.get(key)
+        if type(value) is not int:
+            raise WinAppError(f"{key} must be an integer")
+        values[key] = value
+    action = data.get("action", "click")
+    if not isinstance(action, str) or action not in ("click", "double_click", "right_click", "scroll"):
+        raise WinAppError("action must be click, double_click, right_click or scroll")
+    values["action"] = action
+    for key in ("deltaX", "deltaY"):
+        value = data.get(key, 0)
+        if type(value) is not int or not -1200 <= value <= 1200:
+            raise WinAppError(f"{key} must be an integer between -1200 and 1200")
+        values[key] = value
+    if action != "scroll" and (values["deltaX"] or values["deltaY"]):
+        raise WinAppError("Scroll deltas are only valid for a scroll action")
+    if action == "scroll" and not (values["deltaX"] or values["deltaY"]):
+        raise WinAppError("A scroll action needs a non-zero delta")
+    if values["x"] != round(values["elementBounds"]["x"] + values["elementBounds"]["w"] / 2) \
+            or values["y"] != round(values["elementBounds"]["y"] + values["elementBounds"]["h"] / 2):
+        raise WinAppError("Click coordinates must be the center of the previewed UI Automation control")
+    return values
+
+
+def _validated_input(data: dict[str, Any]) -> dict[str, Any]:
+    values = _validated_action_binding(data)
+    values["kind"] = data.get("kind")
+    if values["kind"] == "type":
+        text = data.get("text")
+        if not isinstance(text, str) or not 1 <= len(text) <= MAX_INPUT_TEXT_CHARS \
+                or not all(char.isprintable() and unicodedata.category(char) not in ("Cc", "Cf", "Cs")
+                           for char in text):
+            raise WinAppError(f"text must contain 1-{MAX_INPUT_TEXT_CHARS} printable characters")
+        values["text"] = text
+    elif values["kind"] == "key":
+        key = data.get("key")
+        if not isinstance(key, str) or key not in INPUT_KEYS:
+            raise WinAppError("key must be one of: " + ", ".join(INPUT_KEYS))
+        values["key"] = key
+    else:
+        raise WinAppError("kind must be type or key")
+    return values
+
+
+def _action_fingerprint(values: dict[str, Any]) -> str:
+    payload = json.dumps(values, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _cached_action_locked(values: dict[str, Any]) -> tuple[tuple[str, str], str, dict[str, Any] | None]:
+    key = (values["owner"], values["actionId"])
+    fingerprint = _action_fingerprint(values)
+    cached = _ACTION_CACHE.get(key)
+    if cached is None:
+        return key, fingerprint, None
+    if cached["fingerprint"] != fingerprint:
+        raise WinAppError("actionId was already used for a different action",
+                          status=409, code="ACTION_ID_REUSED")
+    if cached["state"] == "pending":
+        raise WinAppError("This action is already being processed", status=409, code="ACTION_PENDING")
+    if cached["state"] == "error":
+        raise WinAppError(cached["message"], status=cached["status"], code=cached["code"])
+    if cached["state"] == "unknown":
+        raise WinAppError("The previous action outcome is uncertain; do not retry it",
+                          status=409, code="ACTION_OUTCOME_UNKNOWN")
+    return key, fingerprint, dict(cached["result"])
+
+
+def _store_action_locked(key: tuple[str, str], entry: dict[str, Any]) -> None:
+    _ACTION_CACHE[key] = entry
+    while len(_ACTION_CACHE) > MAX_ACTION_CACHE:
+        _ACTION_CACHE.pop(next(iter(_ACTION_CACHE)))
+
+
+def _validated_action_snapshot(
+    hwnd: int,
+    window: dict[str, Any],
+    values: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    identity = _window_identity(hwnd, window)
+    if _window_token(hwnd, window) != values["windowToken"]:
+        raise WinAppError("The selected window changed; review the action again",
+                          status=409, code="WINDOW_CHANGED")
+    elements, _trimmed = _uia_read_elements_bounded(hwnd, window)
+    current_hwnd, current_window = _visible_window(hwnd)
+    if current_hwnd != hwnd or _window_identity(hwnd, current_window) != identity \
+            or _window_token(hwnd, current_window) != values["windowToken"]:
+        raise WinAppError("The selected window changed during validation; review the action again",
+                          status=409, code="WINDOW_CHANGED")
+    elements = _uia_sort_elements(elements)
+    if _element_revision(elements) != values["revision"]:
+        raise WinAppError("The UI changed after the action preview; review it again",
+                          status=409, code="UIA_STALE")
+    element = next(
+        (candidate for candidate in elements if candidate["elementId"] == values["elementId"]), None
+    )
+    expected_bounds = values["elementBounds"]
+    if element is None or any(
+        element[key] != expected_bounds[key] for key in ("x", "y", "w", "h")
+    ):
+        raise WinAppError("The previewed UI Automation control moved or disappeared",
+                          status=409, code="UIA_TARGET_CHANGED")
+    if not element["enabled"]:
+        raise WinAppError("The previewed UI Automation control is disabled",
+                          status=409, code="UIA_TARGET_CHANGED")
+    return current_window, elements, element
+
+
+def _same_ui_except_focus(first: list[dict[str, Any]], second: list[dict[str, Any]]) -> bool:
+    def normalized(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {key: value for key, value in element.items() if key != "focused"}
+            for element in _uia_sort_elements(elements)
+        ]
+    return normalized(first) == normalized(second)
+
+
+def winapps_control_click(data: dict[str, Any]) -> dict[str, Any]:
+    window = None
+    values: dict[str, Any] = {}
+    try:
+        values = _validated_click(data)
+        with _CONTROL_LOCK:
+            key, fingerprint, replay = _cached_action_locked(values)
+            if replay is not None:
+                return replay
+            _require_control_locked(values["owner"], data.get("confirm"))
+            hwnd, window = _visible_window(values["windowId"])
+            if not 0 <= values["x"] < window["width"] or not 0 <= values["y"] < window["height"]:
+                raise WinAppError("Click coordinates are outside the selected window")
+            window, elements, element = _validated_action_snapshot(hwnd, window, values)
+            _focus_window(hwnd, values["windowToken"])
+            hwnd, window = _visible_window(hwnd)
+            if _window_token(hwnd, window) != values["windowToken"]:
+                raise WinAppError("The selected window changed; review the action again",
+                                  status=409, code="WINDOW_CHANGED")
+            current_elements, _trimmed = _uia_read_elements_bounded(hwnd, window)
+            if not _same_ui_except_focus(elements, current_elements):
+                raise WinAppError("The UI changed while focusing the selected window; review it again",
+                                  status=409, code="UIA_STALE")
+            current_element = next(
+                (candidate for candidate in current_elements
+                 if candidate["elementId"] == values["elementId"]), None
+            )
+            if current_element is None or any(
+                current_element[field] != element[field]
+                for field in ("role", "label", "x", "y", "w", "h", "enabled")
+            ) or not current_element["enabled"]:
+                raise WinAppError("The previewed UI Automation control changed; review it again",
+                                  status=409, code="UIA_TARGET_CHANGED")
+            _require_control_locked(values["owner"], data.get("confirm"))
+            _store_action_locked(key, {"fingerprint": fingerprint, "state": "pending"})
+            try:
+                _send_mouse_action(
+                    hwnd, values["x"], values["y"], values["action"],
+                    values["deltaX"], values["deltaY"], values["windowToken"], element,
+                )
+            except WinAppError as exc:
+                _store_action_locked(key, {
+                    "fingerprint": fingerprint, "state": "error",
+                    "message": str(exc), "status": exc.status, "code": exc.code,
+                })
+                raise
+            finally:
+                if _ACTION_CACHE.get(key, {}).get("state") == "pending":
+                    _store_action_locked(key, {
+                        "fingerprint": fingerprint, "state": "unknown",
+                    })
+            _CONTROL_STATE["armedAt"] = time.monotonic()
+            result = {
+                "ok": True, "actionSent": True, "windowId": hwnd, "x": values["x"],
+                "y": values["y"], "action": values["action"], "actionId": values["actionId"],
+            }
+            _store_action_locked(key, {
+                "fingerprint": fingerprint, "state": "done", "result": result,
+            })
+        _record_audit("click", window=window, detail={
+            "x": values["x"], "y": values["y"], "action": values["action"],
+            "actionId": values["actionId"], "ok": True,
+        })
+        return result
+    except WinAppError as exc:
+        _record_audit("click", window=window, detail={
+            "x": values.get("x"), "y": values.get("y"), "action": values.get("action"),
+            "actionId": values.get("actionId"), "ok": False, "reason": str(exc)[:120],
+        })
+        raise
+
+
+def winapps_control_input(data: dict[str, Any]) -> dict[str, Any]:
+    window = None
+    values: dict[str, Any] = {}
+    try:
+        values = _validated_input(data)
+        with _CONTROL_LOCK:
+            key, fingerprint, replay = _cached_action_locked(values)
+            if replay is not None:
+                return replay
+            _require_control_locked(values["owner"], data.get("confirm"))
+            hwnd, window = _visible_window(values["windowId"])
+            window, elements, element = _validated_action_snapshot(hwnd, window, values)
+            _uia_read_elements_bounded(
+                hwnd, window, focus_element_id=values["elementId"],
+                expected_revision=values["revision"], expected_bounds=values["elementBounds"],
+            )
+            hwnd, window = _visible_window(hwnd)
+            if _window_token(hwnd, window) != values["windowToken"]:
+                raise WinAppError("The selected window changed; review the action again",
+                                  status=409, code="WINDOW_CHANGED")
+            current_elements, _trimmed = _uia_read_elements_bounded(hwnd, window)
+            current_element = next(
+                (candidate for candidate in current_elements
+                 if candidate["elementId"] == values["elementId"]), None
+            )
+            if current_element is None or any(
+                current_element[field] != element[field]
+                for field in ("role", "label", "x", "y", "w", "h", "enabled")
+            ) or not current_element["enabled"] or not current_element["focused"]:
+                raise WinAppError("Windows could not focus the previewed UI Automation control",
+                                  status=409, code="FOCUS_FAILED")
+            _require_control_locked(values["owner"], data.get("confirm"))
+            _store_action_locked(key, {"fingerprint": fingerprint, "state": "pending"})
+            try:
+                _send_keyboard_input(
+                    hwnd, values["kind"], values.get("text"), values.get("key"),
+                    values["windowToken"], current_element,
+                )
+            except WinAppError as exc:
+                _store_action_locked(key, {
+                    "fingerprint": fingerprint, "state": "error",
+                    "message": str(exc), "status": exc.status, "code": exc.code,
+                })
+                raise
+            finally:
+                if _ACTION_CACHE.get(key, {}).get("state") == "pending":
+                    _store_action_locked(key, {
+                        "fingerprint": fingerprint, "state": "unknown",
+                    })
+            _CONTROL_STATE["armedAt"] = time.monotonic()
+            detail = {
+                "kind": values["kind"],
+                "ok": True,
+                "textLength": len(values.get("text", "")),
+                "key": values.get("key"),
+                "actionId": values["actionId"],
+            }
+            result = {"ok": True, "actionSent": True, "windowId": hwnd, **detail}
+            _store_action_locked(key, {
+                "fingerprint": fingerprint, "state": "done", "result": result,
+            })
+        _record_audit("input", window=window, detail=detail)
+        return result
+    except WinAppError as exc:
+        _record_audit("input", window=window, detail={
+            "kind": values.get("kind"), "textLength": len(values.get("text", "")),
+            "key": values.get("key"), "actionId": values.get("actionId"),
+            "ok": False, "reason": str(exc)[:120],
+        })
+        raise
 
 
 def doctor() -> dict[str, Any]:

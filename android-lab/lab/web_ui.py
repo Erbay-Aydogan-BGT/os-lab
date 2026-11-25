@@ -59,7 +59,7 @@ try:
 except ImportError:
     web_api = None
 try:
-    import winapps  # noqa: E402  (console/winapps.py: read-only native Windows app mirror)
+    import winapps  # noqa: E402  (console/winapps.py: native Windows app mirror and guarded UIA control)
 except ImportError:
     winapps = None
 try:
@@ -560,9 +560,41 @@ class LabHttpHandler(BaseHTTPRequestHandler):
                 self._json(501, {"error": "The Windows app mirror module (console/winapps.py) is not installed"})
                 return
             try:
-                self._send_bytes(200, winapps.winapps_window_screenshot(parts[4]), "image/png", cache="no-store")
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query, keep_blank_values=True)
+                expected_token = (query.get("windowToken") or [None])[0]
+                self._send_bytes(
+                    200, winapps.winapps_window_screenshot(parts[4], expected_token),
+                    "image/png", cache="no-store",
+                )
             except winapps.WinAppError as exc:
-                self._json(exc.status, {"error": str(exc)})
+                self._json(exc.status, {"error": str(exc), "code": exc.code})
+        elif len(parts) == 6 and parts[:4] == ["api", "labs", "winapps", "apps"] and parts[5] == "elements":
+            if winapps is None:
+                self._json(501, {"error": "The Windows app mirror module (console/winapps.py) is not installed"})
+                return
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query, keep_blank_values=True)
+            revision = (query.get("revision") or [None])[0]
+            expected_token = (query.get("windowToken") or [None])[0]
+            try:
+                self._json(200, winapps.winapps_window_elements(parts[4], revision, expected_token))
+            except winapps.WinAppError as exc:
+                self._json(exc.status, {"error": str(exc), "code": exc.code})
+        elif len(parts) == 6 and parts[:4] == ["api", "labs", "winapps", "apps"] and parts[5] == "search":
+            if winapps is None:
+                self._json(501, {"error": "The Windows app mirror module (console/winapps.py) is not installed"})
+                return
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query, keep_blank_values=True)
+            search_query = (query.get("q") or [""])[0]
+            expected_token = (query.get("windowToken") or [None])[0]
+            try:
+                self._json(200, winapps.winapps_search_elements(parts[4], search_query, expected_token))
+            except winapps.WinAppError as exc:
+                self._json(exc.status, {"error": str(exc), "code": exc.code})
+        elif len(parts) == 4 and parts[:2] == ["api", "labs"] and parts[2:] == ["winapps", "control"]:
+            if winapps is None:
+                self._json(501, {"error": "The Windows app mirror module (console/winapps.py) is not installed"})
+                return
+            self._json(200, winapps.winapps_control_state())
         elif len(parts) == 6 and parts[:4] == ["api", "labs", "winapps", "apps"] and parts[5] == "stream":
             self._winapps_stream(parts[4])
         elif path == "/api/jobs":
@@ -732,14 +764,15 @@ class LabHttpHandler(BaseHTTPRequestHandler):
 
         frames = None
         try:
-            frames = iter(winapps.winapps_window_stream(window_id, fps))
+            expected_token = (query.get("windowToken") or [None])[0]
+            frames = iter(winapps.winapps_window_stream(window_id, fps, expected_token))
             first = next(frames)
             winapps.validate_png_frame(first)
         except winapps.WinAppError as exc:
             close = getattr(frames, "close", None)
             if close:
                 close()
-            self._json(exc.status, {"error": str(exc)})
+            self._json(exc.status, {"error": str(exc), "code": exc.code})
             return
         except StopIteration:
             close = getattr(frames, "close", None)
@@ -806,7 +839,27 @@ class LabHttpHandler(BaseHTTPRequestHandler):
 
     def _lab_post(self, path: str):
         parts = [p for p in path.split("/") if p]
-        if path == "/api/labs/macos/control":
+        if path.startswith("/api/labs/winapps/"):
+            if winapps is None:
+                self._json(501, {"error": "The Windows app mirror module (console/winapps.py) is not installed"})
+                return
+            try:
+                if path == "/api/labs/winapps/control":
+                    data = self._read_json()
+                    result = winapps.winapps_control_arm(data.get("armed"), data.get("owner"))
+                elif path == "/api/labs/winapps/click":
+                    result = winapps.winapps_control_click(self._read_json())
+                elif path == "/api/labs/winapps/input":
+                    result = winapps.winapps_control_input(self._read_json())
+                elif path == "/api/labs/winapps/stop":
+                    result = winapps.winapps_panic_stop()
+                else:
+                    self._json(404, {"error": "Not found"})
+                    return
+                self._json(200, result)
+            except winapps.WinAppError as exc:
+                self._json(exc.status, {"error": str(exc), "code": exc.code})
+        elif path == "/api/labs/macos/control":
             data = self._read_json()
             owner = data.get("owner") if isinstance(data.get("owner"), str) and len(data.get("owner")) <= 64 else None
             self._json(200, oslab.macos_control_arm(REPO_ROOT, data.get("armed") is True, owner))

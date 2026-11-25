@@ -378,6 +378,8 @@ export interface MacSearchInfo {
 export interface WinApp {
   /** Stable HWND; Windows can reuse an HWND only after the window is gone. */
   windowId: number;
+  /** Opaque process/thread/window identity; changes if Windows reuses the HWND. */
+  windowToken: string;
   pid: number;
   app: string;
   /** Whether the owning process is elevated; null when Windows would not report it. */
@@ -393,6 +395,82 @@ export interface WinAppsInfo {
   available: boolean;
   reason: string | null;
   windows: WinApp[];
+}
+export interface WinElement {
+  elementId: string;
+  role: string;
+  label: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  enabled: boolean;
+  focused: boolean;
+  movedFrom?: { x: number; y: number };
+}
+export interface WinElementDiff {
+  added: WinElement[];
+  changed: WinElement[];
+  removed: WinElement[];
+}
+export interface WinElementsInfo {
+  windowId: number;
+  windowToken: string;
+  app: string;
+  bounds: { x: number; y: number; width: number; height: number };
+  revision: string;
+  engine: "uia";
+  trimmed: boolean;
+  elements: WinElement[];
+  diff: WinElementDiff;
+}
+export interface WinSearchInfo {
+  windowId: number;
+  windowToken: string;
+  app: string;
+  revision: string;
+  engine: "uia";
+  query: string;
+  count: number;
+  hits: WinElement[];
+}
+export interface WinControlState {
+  armed: boolean;
+  owner: string | null;
+  expiresInSec: number;
+  audit: WinAuditRow[];
+}
+export interface WinAuditRow {
+  time: number;
+  kind: string;
+  windowId?: number;
+  app?: string;
+  ok?: boolean;
+  reason?: string;
+}
+export type WinInputKind = "type" | "key";
+export type WinInputKey = "tab" | "escape" | "backspace" | "delete" | "up" | "down" | "left" | "right" | "enter";
+export interface WinActionBinding {
+  windowId: number;
+  windowToken: string;
+  revision: string;
+  elementId: string;
+  elementBounds: Pick<WinElement, "x" | "y" | "w" | "h">;
+  owner: string;
+  actionId: string;
+  confirm: true;
+}
+export interface WinClickAction extends WinActionBinding {
+  x: number;
+  y: number;
+  action?: "click" | "double_click" | "right_click" | "scroll";
+  deltaX?: number;
+  deltaY?: number;
+}
+export interface WinInputAction extends WinActionBinding {
+  kind: WinInputKind;
+  text?: string;
+  key?: WinInputKey;
 }
 export interface Report {
   name: string;
@@ -809,9 +887,27 @@ export const api = {
   macosAxPerform: (input: { pid: number; path: string; identity?: string; action: string; windowId?: number }) =>
     post<{ ok: boolean; actionSent: boolean }>("/api/labs/macos/element/perform", input),
   winappsApps: () => call<WinAppsInfo>("/api/labs/winapps/apps"),
-  winappsAppScreenshotUrl: (windowId: number) => `/api/labs/winapps/apps/${windowId}/screenshot`,
-  winappsAppStreamUrl: (windowId: number, fps: number) =>
-    `/api/labs/winapps/apps/${windowId}/stream?fps=${fps}`,
+  winappsAppScreenshotUrl: (windowId: number, windowToken?: string) =>
+    `/api/labs/winapps/apps/${windowId}/screenshot${windowToken ? `?windowToken=${encodeURIComponent(windowToken)}` : ""}`,
+  winappsAppStreamUrl: (windowId: number, fps: number, windowToken?: string) =>
+    `/api/labs/winapps/apps/${windowId}/stream?fps=${fps}${windowToken ? `&windowToken=${encodeURIComponent(windowToken)}` : ""}`,
+  winappsElements: (windowId: number, revision?: string, windowToken?: string) => {
+    const query = new URLSearchParams();
+    if (revision) query.set("revision", revision);
+    if (windowToken) query.set("windowToken", windowToken);
+    const suffix = query.toString();
+    return call<WinElementsInfo>(`/api/labs/winapps/apps/${windowId}/elements${suffix ? `?${suffix}` : ""}`);
+  },
+  winappsSearch: (windowId: number, query: string, windowToken?: string) =>
+    call<WinSearchInfo>(`/api/labs/winapps/apps/${windowId}/search?q=${encodeURIComponent(query)}${windowToken ? `&windowToken=${encodeURIComponent(windowToken)}` : ""}`),
+  winappsControl: () => call<WinControlState>("/api/labs/winapps/control"),
+  winappsControlArm: (armed: boolean, owner?: string) =>
+    post<WinControlState>("/api/labs/winapps/control", { armed, owner }),
+  winappsClick: (input: WinClickAction) =>
+    post<{ ok: boolean; actionSent: boolean; windowId: number; x: number; y: number; action: string; actionId: string }>("/api/labs/winapps/click", input),
+  winappsInput: (input: WinInputAction) =>
+    post<{ ok: boolean; actionSent: boolean; windowId: number; kind: WinInputKind; textLength: number; key?: WinInputKey; actionId: string }>("/api/labs/winapps/input", input),
+  winappsStop: () => post<{ ok: boolean; disarmed: boolean }>("/api/labs/winapps/stop", {}),
   plan: (request: LabRequest) => post<{ plan: LabPlan; token: string }>("/api/labs/plan", { request }),
   start: (request: LabRequest, token: string) => post<LabJob>("/api/labs/start", { request, token }),
   jobs: () => call<{ jobs: LabJob[] }>("/api/jobs"),
